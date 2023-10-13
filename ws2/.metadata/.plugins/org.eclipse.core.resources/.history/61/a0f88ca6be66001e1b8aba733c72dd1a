@@ -1,0 +1,255 @@
+//Balance_Master.h
+//
+//Aleksejs Skorodumovs 07.01.2020
+
+//known issues:
+//thermometer module is not implemented, so temperature data is missing
+
+#include "stm32l4xx_hal.h"
+#include "Clock.h"
+#include "Thermometer.h"
+#include "LTC6803.h"
+#include "Display.h"
+
+#include "debug.h"					// include some build options
+
+#ifndef BALANCE_MASTER_H
+#define BALANCE_MASTER_H
+
+#ifdef RECORD_CHARGING_CYCLE
+	#define INVALID_CHARGE_PERCENTAGE	0xFF				// any number larger than 100, initialise "initial_start_charge_percentage" to it to indicate no charging has started yet
+#endif	
+
+class Balance_Master {
+
+public:
+	//PRESET PARAMETERS
+	static const uint8_t hist_len=5;//5;//how many history values to use for data
+	static const uint8_t samples=10;
+	static const uint8_t chips=2; //with cod please
+	static const uint8_t total_cells=14;
+	static const uint8_t cells[chips];
+
+
+	//MARGINS AND DELAYS
+	float charging_low_v_margin=2.50; //any (filtered) cell below this - can't charge, cell might be damaged
+	//we didn't really have this parameter before, but since it can be dangerous to charge with full charge current when battery is low, we thought it'd be best to have this
+	//it's 2.8 just in case we balance to 2.9, then can't balance anymore, but we can at least top it up and then balance
+	//float charging_high_v_margin=4.25;
+	float charging_high_v_margin=4.21; //any (filtered) cell above this - can't charge, will overcharge [CKL worklog 23-W24-01] : changed from 4.25 to 4.2
+										// [CKL worklog 23-W26-02] : Many "Error: 002" were found, if setting this value to 4.2V, when nearly fully charged 
+										//  This value "charging_high_v_margin" is thus changed to 4.21 to have 10mV over-charged in the worst case. 
+										//  As not all cells charged to 4.2V at the same time, the charger will keep charging voltage at 58.8V (4.2V x14) when the charging current is high enough. 
+										//  The first cell arrived 4.2V may be charged up to 4.21V in the worst case. [CKL worklog 23-W26-02 end]
+	float charging_imbalance_margin=0.040; //imbalance greater than this - can't charge, internal resistance too different (40mV)
+//	float charging_imbalance_margin=0.5; //imbalance greater than this - can't charge, internal resistance too different (0.5V i.e. disable balancing !)	
+	//changed from 50 to 40 because 50 seemed slightly too much to be charging at (this though might increase if imbalance increases during charging)
+	//this is also a signal for a customer if they forget to balance their batteries - if the battery is too unbalanced it wouldn't charge till they do balancing
+	float LTC_temperature_margin=65.0; //any chip temp higher than this - can't charge, board overheated
+	float ext_thermometer_margin=65.0; //any thermometer temp higher than this - can't charge, external thermometers overheated
+// [CKL] : Add hysteresis for sensing OT. If not already in OT, OT=true only if max_t>65. If already in OT, OT returns to false only if max_t<=60	
+	const float OT_hysteresis=5.0;
+// [CKL] : End	
+// [CKL] : Update the voltage thresholds for imbalance 
+//	float balance_low_stop_v_margin=0.001; //imbalance is below low marg 10mV - no need to balance
+//	float balance_hysteresis_v_margin=0.002; //if balancing starting above 20mV - balance, if below - don't
+	float balance_low_stop_v_margin=0.010; //imbalance is below low marg 10mV - no need to balance
+	float balance_hysteresis_v_margin=0.020; //if balancing starting above 20mV - balance, if below - don't	
+//	float balance_low_stop_v_margin=0.005; //imbalance is below low marg - no need to balance
+//	float balance_hysteresis_v_margin=0.010; //if balancing starting above - balance, if below - don't
+// [CKL] : End	
+	//changed from 15 to 10. reasoning is that we don't really want to have battery unbalanced more that some 8-10mV and refusing to balance
+	float balance_high_stop_v_margin=0.100; //something went terribly wrong, dangerous to balance (?)
+	//additional reasoning is that erroring out over this margin would be seen as an error
+	float balance_low_cell_voltage=2.70; //cell (that's about to be discharged) voltage is too low, balancing impossible
+	//changed from 3.00V to 2.90V because while discharging below 3.0 is not desired, usually when battery is drained to about 3V/cell, it still needs some margin to balance
+	float total_battery_low_voltage = 37.8; //Once total battery lower than this, total shutdown
+	uint32_t cell_switch_timer_delay=3*1000; //10sec //how long cell discharge happens (switch time between odds and evens)
+	uint32_t cooldown_timer_discharge_duration=12*1000; //12 seconds //2min //this actually requires some testing as we don't know when discharge resistors overheat
+	//uint32_t cooldown_timer_discharge_duration=60*1000; //12 seconds //2min //this actually requires some testing as we don't know when discharge resistors overheat
+	uint32_t cooldown_timer_cooldown_duration=36*1000; //24 //1min
+	//uint32_t PIC_comms_timer_duration = 12*1000;
+	//comment on process: discharge happens for 2 minutes, after that follows cooldown 1 minute
+	//during discharge each 10s odd and even cells get switched so they don't overheat
+	//this works currently, but to find out what's optimal, or suitable for arctic and desert - need some testing
+	uint32_t communication_timer_interval=1*1000; //time between LTC data reads
+	uint32_t startup_timer_delay=30*1000; //not balancing at startup
+	uint32_t shutdown_timer_delay=12*60*60*1000; //time before shutdown command is sent to turn off LV side (12 hours)
+//	uint32_t shutdown_timer_delay=2*60*1000; //time before shutdown command is sent to turn off LV side (2 mins for testing)	
+	uint32_t check_charging_timer_duration=1*60*1000; //20 minutes check if battery still charging
+	uint32_t monitoring_timer_duration=1*60*60*1000; //1 hour window that monitoring is left on for
+
+
+	//COMMUNICATION WITH IC
+	SPI_HandleTypeDef spi_ltc; //SPI interface
+	LTC6803 ltc_interface; //lib to send commands and decode return data
+	// [FF 2023.10.09]
+	RTC_HandleTypeDef hrtc;
+	// [FF End]
+
+	//CELL DATA
+	struct cell_data { //this structure is for internal storage, don't pass it outside
+		float v_raw[hist_len]; //voltage reading history
+		float v_offset; //calculated measurement offset
+		float v_corrected; //filtered voltage
+		float v_median[hist_len]; //sorted median values
+		bool OV[hist_len]; //over-voltage flag history
+		bool UV[hist_len]; //under-voltage flag history
+		bool OW[hist_len]; //open wires flag history
+		bool ov_corrected; //filtered OV flag
+		bool uv_corrected; //filtered UV flag
+		bool ow_corrected; //filtered OW flag
+	};
+	cell_data cells_array[chips][12]; //contains BMS cell data
+	uint8_t chip_n, cell_n; //temporary data used by address conversion
+	float temperature[chips];
+
+	//AGGREGATED PARAMS
+	float imbalance; //in V, calculates from filtered
+	float lowest_cell; //in V, from filtered
+	float highest_cell; //in V, from filtered
+	float total_voltage; //in V, from filtered
+	bool UV, OV, OW; //flags for the whole battery, from filtered
+	float thermometer; //external thermometer reading
+	float stored_v[samples]; //
+	float v_compare[2] = {0,0};
+	float v_difference;
+	uint8_t iterate;
+	float v_factor;
+	bool charge_start;
+	uint64_t total_charged;
+	uint8_t start_charge_percentage;
+	uint32_t address;
+	float total_cycles;
+#ifdef RECORD_CHARGING_CYCLE
+	uint32_t	timespan_whole, timespan_start;			// record the timespan of charging/discharging cycle [CKL worklog 23-W16-01]
+	uint8_t 	initial_start_charge_percentage;		// as the BMS will turn off the charger, in the middle of charging, to test if charging is in-progress, i.e. the variable "start_charge_percentage" changes during charging
+	uint8_t		initial_start_charge_voltage[2];		// voltage in V, in the format of 3.123 (i.e. 4 HEX digits, MSB first), at the beginning of charging
+#endif
+
+	//CHARGE DECISION
+	bool OT; //overtemperature flag
+	bool TF; //thermometer fault flag - if a thermometer is disconnected/faulty or it's output is weird
+	bool ok_to_charge;
+// [CKL worklog 22-W11-07] 
+	bool fForceChargerOff;
+// [CKL end]	
+
+	//BALANCE DECISION
+	bool balance_decision[total_cells]; //cells picked for balancing
+	bool balancing_override[total_cells]; //cells forced to balance
+	bool ok_to_balance;
+	bool is_balancing; //used as history for hysteresis, and for led output
+	bool balance_forbidden; //override used to forbid all balancing
+	bool is_balanced; //new variable to check whether battery is balanced to avoid error code issues
+	//NEW FLAGS
+	bool DE; //if the bms to be discharged (when discharge to storage is triggered)
+	bool CE; //if the bms to be charged (should be on most time, allows stopping charger on user command)
+	bool charge_flag;
+
+	//NEW ERRORS
+	uint8_t imbal_count;
+	bool temp_error;
+	bool lv_error;
+	bool imbal_error;
+	bool fault_error;
+
+	//CLOCK AND TIMERS
+	Clock* clk; //clock reference, required to use timers, must be initialized
+	uint8_t cell_switch_timer_nr; //assigned by clock
+	uint8_t cooldown_timer_nr; //assigned by clock
+	uint8_t communication_timer_nr; //assigned by clock
+	uint8_t startup_timer_nr; //assigned by clock
+	uint8_t shutdown_timer_nr; //assigned by clock
+	uint8_t check_charging_timer_nr; //assigned by clock
+	uint8_t monitoring_timer_nr; //assigned by clock
+	bool cell_switch_phase; //which cells discharge: 0 for evens, 1 for odds
+	bool cooldown_phase; //cooldown state: 0 for discharge, 1 for cooldown
+	bool startup_phase; //startup state: 1 for startup, 0 for normal operation
+
+	//THERMOMETER
+	Thermometer* thrm;
+
+	//DISPLAY
+	Display* dsp;
+
+	//STATUS AND DECISIONS
+	uint8_t error_code; //this tells what is the issue, 0 - no issue
+	uint8_t charge_state; //0 is low, 1 is good to fly, 2 is full
+	uint8_t press_type;
+	uint32_t button_pressed_time;
+	bool button_state, last_button_state;
+	bool total_shutdown, LV_shutdown;
+	bool charge_status; //shows whether battery is charging or not
+	// [FF 2023.10.03]
+	bool charge_stat_fr_charger = false;	// it is updated from interface.c / interface.h
+	bool charge_stat_connect = false;		// it is updated from interface.c / interface.h
+	bool is_charger_existed = false;		// it is updated from interface.c / interface.h
+	uint8_t pressed_cnt = 0;
+	uint32_t button_unpressed_time;
+	enum { LOW_CHARGE=0, GOOD_TO_FLY=1, FULL_CHARGE=2, INACTIVE=0, SHORT=1, LONG=2, DISCHA=3};
+	bool is_discharging_monitor = false;
+	bool press_to_dump_log = false;
+	// [FF End]
+	bool monitoring;
+	
+	//FUNCTIONS
+	//functions to use with CELL DATA
+	void adr(uint8_t n); //function to convert linear cell address to chip and number
+	uint8_t adr(uint8_t chp_n, uint8_t cel_n); //function to convert chip and number back to linear address
+	void push(uint8_t n, float v, bool ov, bool uv, bool ow); //function to push voltage+flags to history
+	void push(uint8_t ch, uint8_t cl, float v, bool ov, bool uv, bool ow); //alternative, without linear number
+	void correct(uint8_t n); //function to calculate corrected voltages and flags
+	void set_offset(uint8_t n, float offset); //function to set v_offset
+	float get_offset(uint8_t n); //function to request v_offset
+	enum { RAW=0, CORRECTED=1 }; //enum for getting voltage
+	float get_voltage(uint8_t n, bool t); //function to request voltage
+
+	void collect_data(); //collects total voltage, minimum and maximum cell, calcs imballance
+	bool cell_good_for_discharge(uint8_t adr, int chip); //checks if the cell should actally be discharged, taking all settings into account
+	void order_balancing(); //orders LTC chips to balance
+	void order_shutdown(); //orders LTC chip to shutdown
+	void balancing_done(); //shuts down LV side after balancing is complete
+	void make_charge_decision(); //sets ok_to_charge according to the rule set
+	void make_balance_decision(); //sets ok_to_balance and balance_decision[] according to the rule set
+	// [FF 2023.09.26] enhanced get percentage
+	uint8_t get_charge_percentage(); //calculate the total percentage charge of the battery
+	uint8_t get_charge_percentage(float _volt);
+	uint8_t calc_charge_percentage(float _volt);
+	// [FF End]
+	void assemble_error_code(); //set of rules that defines how error code is constructed
+	void calculate_battery_cycles(uint8_t battery_pct);
+	uint64_t read_battery_cycles(uint32_t start_page_address);
+	void write_battery_cycles(uint32_t start_page_address, uint64_t cycles);
+	uint32_t get_page(uint32_t address);
+
+
+
+	bool cell_switch_timeout(); //checks for timeout and reloads timer
+	bool cooldown_timeout();
+	bool communication_timeout();
+	bool startup_timeout();
+	bool shutdown_timeout();
+	bool check_charging_timeout();
+	bool monitoring_timeout();
+	void setup_monitoring_timer();
+
+	void standby_mode();
+	void calculate_button_press();
+	void PIC_shutdown_communication();
+	void check_charging_status();
+	bool charging_curve_too_flat(float slope);
+	bool IsGlitches(float average);				// [CKL worklog 22-W39-06] : remove a glitch in total voltage reading, which leading the BMS think it is in charging
+	
+	enum { NOT_CHARGING = 0, CHARGING = 1 };
+
+	//data requests, action orders, override variables and functions to set them can be added later
+
+	//ESSENTIAL FUNCTIONS:
+
+	void init( SPI_HandleTypeDef h1, Clock* c, Thermometer* t, Display* dis, RTC_HandleTypeDef _hrtc ); //initialise everything
+	void work(); //do the thing
+
+};
+
+#endif

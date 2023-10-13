@@ -1,0 +1,97 @@
+//Interface.h
+//
+//Aleksejs Skorodumovs 08.01.2021
+
+//known issues to fix later:
+//should test parameters to only contain numeric values - digits + - .
+//on input should only keep (and loopback) printable characters and \n \r
+
+//missing functions:
+//respond with interpretation of the command: cmd + values for user to see
+//generate charger string
+//data output functions for everything
+
+#ifndef INTERFACE_H
+#define INTERFACE_H
+
+//#include <usart.h>
+#include "stm32l4xx_hal.h"
+#include "Balance_Master.h"
+#include <string>
+#include <vector>
+
+class Interface {
+public:
+
+	std::string code_ver="000"; //dummy value, originally planned for firmware version but unused. Needs to stay as chargers only see specific data lengths.
+
+	Clock* clk; //reference to clock
+	Balance_Master* bm; //reference to balance master
+	UART_HandleTypeDef* huart1;
+
+	uint16_t device_ID; //what it says
+
+	std::string firmware_version;
+	std::string hardware_version;
+
+	uint8_t interface_output_timer_nr; //timer number to use
+	uint32_t interface_output_interval=1*1000; //time between data outputs
+
+	static const uint8_t max_len=100; //max length for both input and output bufs
+	std::string input_array; //input string to work on
+	std::vector<float> input_params; //stores params read from last cmd
+	uint8_t tx_buf[max_len]; //buffer to put transmission strings in
+
+
+	enum { //descriptive enum for numbering commands
+		SHUTDOWN=0,
+		DISPLAY=1,
+		FORCE_BALANCING=2,
+		FORCE_BALANCE_STOP=3,
+		FORBID_BALANCING=4,
+		UNFORBID_BALANCING=5,
+		MONITORING=6,
+		STOP_MONITORING=7,
+		DUMP_LOG=8};	// to print out the battery charging/discharging log stored in flash memory [CKL worklog 23-W16-01]
+
+
+	//ESSENTIALS
+	void init(Clock* c, Balance_Master* b, UART_HandleTypeDef* h);
+	bool interface_output_timeout(); //checks for timeout and reloads timer
+
+	//OUTPUT FUNCTIONS
+	void print(char c);
+	void print(std::string s);
+	void output();
+	std::string charger_checksum(std::string in);
+	std::string compose_charger_string();
+
+	//INPUT FUNCTIONS
+	void input();
+	void push(char c);
+	std::string match(std::string key);
+	std::vector<std::string> tokenize(std::string istr);
+	bool process_tokens(std::vector<std::string> sv);
+	void process_message();
+	void resolve_cmd(uint8_t cmd_num);
+
+	//DISPLAY STUFF
+	enum { //enum for numbering bits to display
+		IGNORE=0,
+		CHARGER_BLOCK=1,
+		CELL_SUMMARY=2,
+		ALL_VOLTAGES=3,
+		TEMPERATURES=4,
+		BALANCE_LIST=5,
+		TIME_N_STATE=6,
+		DUMP_BAT_LOG=7,	// to print out the battery charging/discharging log stored in flash memory [CKL worklog 23-W16-01]
+		DISP_INFO_TYPE_MAX
+	};
+	static const uint8_t disp_blocks=DISP_INFO_TYPE_MAX;
+	bool disp[disp_blocks]; //holds display block information
+	// [FF 2023.09.25] Adding cycle percentage calculation
+	uint8_t get_charge_percentage(float voltage); //calculate the total percentage charge of the battery
+	// [FF end]
+};
+
+#endif

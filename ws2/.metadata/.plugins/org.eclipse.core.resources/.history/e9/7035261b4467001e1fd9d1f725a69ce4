@@ -1,0 +1,1518 @@
+//Balance_Master.cpp
+//Aleksejs Skorodumovs 07.01.2020
+
+#include "Balance_Master.h"
+#include "Debug.h"
+
+#include <math.h>
+
+#ifdef RECORD_CHARGING_CYCLE		// Record and display the battery charging cycle of the T150 BMS [23-W13-01]
+#include "flash_user_storage.h"
+
+typedef union{
+	uint8_t		byte[2];
+	uint16_t	word;
+}WordType;
+
+void StringTo4HexDigit(uint8_t* str, uint8_t* dataBuf)
+{
+	dataBuf[0] = ((str[0]-'0')&0x0F)<<4;
+	dataBuf[0] = (str[1]-'0') | dataBuf[0];
+	dataBuf[1] = ((str[3]-'0')&0x0F)<<4;
+	dataBuf[1] = (str[4]-'0') | dataBuf[1];	
+}
+#endif	//#ifdef RECORD_CHARGING_CYCLE
+// [CKL] : removed, no DAC in STM32L412
+// #include "Thermometer.h"
+// [CKL]
+
+const uint8_t Balance_Master::cells[chips] = { 7, 7 }; //cell arrangement in array
+Thermometer LMT01; //thermometer class instance
+
+
+void Balance_Master::adr(uint8_t n) {
+	for (uint8_t i = 0; i < chips; i++) { //go through chips
+		if (n >= 0 && n < cells[i]) { //does cell address belong to this chip?
+			chip_n = i;
+			cell_n = n;
+			return; //found
+		} else {
+			n -= cells[i]; //subtract cell count from address
+		}
+	}
+	chip_n = 0;
+	cell_n = 0; //couldn't find, set zero
+}
+
+uint8_t Balance_Master::adr(uint8_t chp_n, uint8_t cel_n) {
+	//todo make a check for address range
+	uint8_t n = 0;
+	for (uint8_t i = 0; i < chp_n; i++)
+		n += cells[i]; //count cells on previous chips
+	return n + cel_n;
+}
+
+void Balance_Master::push(uint8_t ch, uint8_t cl, float v, bool ov, bool uv,
+		bool ow) {
+	for (uint8_t i = hist_len - 1; i > 0; i--) {
+		cells_array[ch][cl].v_raw[i] = cells_array[ch][cl].v_raw[i - 1];
+		cells_array[ch][cl].OV[i] = cells_array[ch][cl].OV[i - 1];
+		cells_array[ch][cl].UV[i] = cells_array[ch][cl].UV[i - 1];
+		cells_array[ch][cl].OW[i] = cells_array[ch][cl].OW[i - 1];
+	}
+	cells_array[ch][cl].v_raw[0] = v;
+	cells_array[ch][cl].OV[0] = ov;
+	cells_array[ch][cl].UV[0] = uv;
+	cells_array[ch][cl].OW[0] = ow;
+}
+
+int cmpfunc(const void *a, const void *b) {
+	//small function used to sort list of values into ascending order
+	return (*(int*) a - *(int*) b); //ascending
+}
+
+#define CKL_DEBUG_CHARGER
+#ifdef CKL_DEBUG_CHARGER
+#define CKL_22_W10_05	0
+#define CKL_22_W11_07	1
+#define CKL_CHECK_CHARGING_STATUS 	CKL_22_W11_07	//CKL_22_W10_05	// CKL_22_W11_07	
+#if (CKL_CHECK_CHARGING_STATUS==CKL_22_W10_05)
+// [CKL worklog 22-W10-05]
+#define LONG_TERM_SAMPLE_SIZE	60	// this number MUST be set according to the value of check_charging_timer_duration defined
+void Balance_Master::check_charging_status() {
+	float v_sum;
+	//find the average of all values in an array then divide this number by the first number of the array
+	//number greater than 1 means upward trend, less than 1 means downwards trend
+	static float pre_v_difference = 0.1; // just pick a number > 0
+
+	static uint32_t iterate_long_term_moving_average=0;
+	static float stored_v_slope[LONG_TERM_SAMPLE_SIZE], long_term_slope_moving_average=0.0f;
+
+	//populate array with corrected voltages
+	if (total_voltage != 0 && iterate < samples) {
+		stored_v[iterate] = total_voltage;
+		iterate++;
+	}
+	else if (iterate == samples) { //once array is full start running the algorithm
+		for (int j = 0; j < samples - 1; j++) {
+			stored_v[j] = stored_v[j + 1];
+		}
+		stored_v[samples - 1] = total_voltage;
+
+		v_sum=0.0f;
+		for (int i = 0; i < samples; i++) {
+			v_sum += stored_v[i];
+		}
+		v_sum /= samples;
+		v_factor = v_sum / stored_v[0];
+
+		if(iterate_long_term_moving_average < LONG_TERM_SAMPLE_SIZE) {
+			stored_v_slope[iterate_long_term_moving_average] = v_factor;
+			iterate_long_term_moving_average++;
+		}
+		else{
+			for (int j = 0; j < LONG_TERM_SAMPLE_SIZE - 1; j++) {
+				stored_v_slope[j] = stored_v_slope[j + 1];
+			}
+			stored_v_slope[LONG_TERM_SAMPLE_SIZE - 1] = v_factor;	
+			
+			v_sum=0.0f;
+			for (int i = 0; i < LONG_TERM_SAMPLE_SIZE; i++) {
+				v_sum += stored_v_slope[i];
+			}
+			long_term_slope_moving_average = v_sum / (float)LONG_TERM_SAMPLE_SIZE;
+		}
+
+		if (charge_flag){	// i.e. already in charging state, see long-term slope change. long_term_slope_moving_average is the 60s moving average of v_factor.
+			if(check_charging_timeout()) {
+				if(charging_curve_too_flat(long_term_slope_moving_average)){
+					charge_status = NOT_CHARGING;
+					charge_flag = 0;				
+				}
+			}
+		}
+		else{	// i.e. not operating in charging state, see short-term slope change. v_factor is nearly to the slope of the recent 10 total_voltage samples
+			if(!charging_curve_too_flat(v_factor)){
+				charge_status = CHARGING;	
+			}			
+		}
+
+		//enter this if statement once at beginning of charge and populate initial comparison
+		if (charge_status == CHARGING && !charge_flag) {
+			clk->setup_timer(check_charging_timer_nr, check_charging_timer_duration);
+			charge_flag = 1;
+		}
+	}
+}
+bool Balance_Master::charging_curve_too_flat(float slope){
+	bool flat=false;
+
+	if(total_voltage < 47.32){
+		if(slope <= 1.0010) flat=true;
+	}
+	else if(total_voltage < 52){
+		if(slope <= 1.0008) flat=true;
+	}	
+	else if(total_voltage < 55){
+		if(slope <= 1.0005) flat=true;
+	}	
+	else if(total_voltage < 57){
+		if(slope <= 1.0002) flat=true;
+	}
+	else{	// >= 57V to fully charge 58.52 ...
+		if(slope <= 1.0001) flat=true;
+	}		
+
+//	if(flat) debug_print("too flat !\r\n");
+//	else debug_print("STEEP ENOUGH !\r\n");
+
+	return flat;
+}
+#else
+#if (CKL_CHECK_CHARGING_STATUS==CKL_22_W11_07)
+// [CKL worklog 22-W11-07]
+#define LONG_TERM_WINDOW_SIZE	30	// this number MUST be set according to the value of check_charging_timer_duration defined
+typedef enum{NULL_LONG_TERM_RISING=0, TRUE_LONG_TERM_RISING, FALSE_LONG_TERM_RISING}State_long_term_rising_check;
+
+void Balance_Master::check_charging_status() {
+	float v_sum;
+	//find the average of all values in an array then divide this number by the first number of the array
+	//number greater than 1 means upward trend, less than 1 means downwards trend
+	static uint32_t count;
+	static float preMaxVoltage, curMaxVoltage=0;
+	static bool fFirstHalf=true;
+	static State_long_term_rising_check stateLongTermRising;
+	static uint32_t nChargerOff;
+
+	if(charge_flag){
+		// compare the max voltage in consecutive 2 non-overlapping 30s windows in each 60s time frame
+		if(total_voltage>curMaxVoltage) curMaxVoltage=total_voltage;
+		if(count == LONG_TERM_WINDOW_SIZE-1){
+			if(fFirstHalf){
+				fFirstHalf = false;
+				preMaxVoltage = curMaxVoltage;
+			}
+			else{
+				if(curMaxVoltage > preMaxVoltage+0.01){						// [ckl] : may change to "curMaxVoltage > preMaxVoltage + 0.01", expect at least 10mV higher, to avoid cannot stop charging even full
+					stateLongTermRising = TRUE_LONG_TERM_RISING;		// it should be in charging. check again in 
+				}
+				else{
+					stateLongTermRising = FALSE_LONG_TERM_RISING;	
+				}
+				preMaxVoltage = curMaxVoltage;
+				curMaxVoltage = 0;				// a small value such that the next total_voltage must higher than curMaxVoltage
+				fFirstHalf = true;
+			}
+			count = 0;
+		}
+		else{
+			count++;
+		}
+	}
+
+	//populate array with corrected voltages
+	if (total_voltage != 0 && iterate < samples) {
+		stored_v[iterate] = total_voltage;
+		iterate++;
+	}
+	else if (iterate == samples) { //once array is full start running the algorithm
+		for (int j = 0; j < samples - 1; j++) {
+			stored_v[j] = stored_v[j + 1];
+		}
+		stored_v[samples - 1] = total_voltage;
+
+		v_sum=0.0f;
+		for (int i = 0; i < samples; i++) {
+			v_sum += stored_v[i];
+		}
+		v_sum /= samples;
+		v_factor = v_sum / stored_v[0];
+
+		if (charge_flag){	// i.e. already in charging state, see long-term slope change. long_term_slope_moving_average is the 60s moving average of v_factor.
+			if(stateLongTermRising){
+				if(stateLongTermRising == FALSE_LONG_TERM_RISING){
+					// probably, it's not in charging
+					// do a off/on cycle to the charging by ok_to_charge
+					// if in charging, there should be a significant drop (>200mV) and rising (v_factor > 1.0005)
+					// if not in charging, not much change in total_voltage
+					charge_status = NOT_CHARGING;
+					charge_flag = 0;	
+					fForceChargerOff = true;
+					nChargerOff = 0;			// start counting up to 5s to check if there's a signifcant drop
+				}
+				else if(stateLongTermRising == TRUE_LONG_TERM_RISING){
+					stateLongTermRising = NULL_LONG_TERM_RISING;	// check again in next 60s, "count" has already set to 0
+				}
+			}
+		}
+		else{	// i.e. not operating in charging state, see short-term slope change. v_factor is nearly to the slope of the recent 10 total_voltage samples
+			if(fForceChargerOff){
+				nChargerOff++;
+				if(v_factor <= 0.998 || nChargerOff>5){		// over 0.1V drop OR charger has off for 5 seconds (assume the charger will be off in next second)
+					fForceChargerOff = false;				// turn on the charger in next second
+				}
+			}
+			else{
+				if(!charging_curve_too_flat(v_factor) && !IsGlitches(v_sum)){
+					charge_status = CHARGING;	
+				}	
+			}		
+		}
+
+		//enter this if statement once at beginning of charge and populate initial comparison
+		if (charge_status == CHARGING && !charge_flag) {
+			charge_flag = 1;
+
+			// Initial state of the long term voltage rising checker, i.e. count 2 times for "count" from 0 to 29, then "stateLongTermRising" will have the result
+			count = 0;
+			stateLongTermRising = NULL_LONG_TERM_RISING;
+		}
+	}
+}
+bool Balance_Master::charging_curve_too_flat(float slope){
+	bool flat=false;
+
+	if(total_voltage < 47.32){
+		if(slope <= 1.0010) flat=true;
+	}
+	else if(total_voltage < 52){
+		if(slope <= 1.0008) flat=true;
+	}	
+	else if(total_voltage < 55){
+		if(slope <= 1.0005) flat=true;
+	}	
+	else if(total_voltage < 57){
+		if(slope <= 1.0002) flat=true;
+	}
+	else{	// >= 57V to fully charge 58.52 ...
+		if(slope <= 1.0001) flat=true;
+	}		
+
+//	if(flat) debug_print("too flat !\r\n");
+//	else debug_print("STEEP ENOUGH !\r\n");
+
+	return flat;
+}
+// [CKL worklog 22-W39-06] : remove a glitch in total voltage reading, which leading the BMS think it is in charging
+// check the "stored_v[]"
+bool Balance_Master::IsGlitches(float average){
+	for(int i=3;i<samples-1;i++){
+		if((stored_v[i]-10)>stored_v[i+1]) return true;
+	}
+	
+	if(stored_v[1]<(average-0.025)){
+		if(stored_v[2]<(average-0.025)){
+			if((stored_v[3]-stored_v[2]) > 0.030) return true;
+			else return false;
+		}
+		else{
+			return true;
+		}
+	}
+	else{
+		return true;
+	}
+}
+// [CKL worklog 22-W39-06 end]
+#endif	// #if (CKL_CHECK_CHARGING_STATUS==CKL_22_W11_07)
+#endif	// #if (CKL_CHECK_CHARGING_STATUS==CKL_22_W10_05)
+#else	// if not (#ifdef CKL_DEBUG_CHARGER)
+// [CKL] : Original one, i.e. before KL
+void Balance_Master::check_charging_status() {
+	float v_sum = 0.0;
+	//find the average of all values in an array then divide this number by the first number of the array
+	//number greater than 1 means upward trend, less than 1 means downwards trend
+
+	//populate array with corrected voltages
+	if (total_voltage != 0 && iterate < samples) {
+		stored_v[iterate] = total_voltage;
+		iterate++;
+	}
+
+	//once array is full start running the algorithm
+	else if (iterate == samples) {
+		for (int j = 0; j < samples - 1; j++) {
+			stored_v[j] = stored_v[j + 1];
+		}
+		stored_v[samples - 1] = total_voltage;
+
+		for (int i = 0; i < samples; i++) {
+			v_sum += stored_v[i];
+		}
+		v_sum /= samples;
+		v_factor = v_sum / stored_v[0];
+
+		//this value shows whether battery charge has gone up or down over a  longer period of time (5 mins?)
+		//useful in detecting whether the battery is charging once voltage changes are less dramatic
+		if (charge_flag && check_charging_timeout()) {
+			if (v_compare[1] == 0)
+				v_compare[1] = total_voltage;
+			else if (v_compare[0] != 0 && v_compare[1] != 0) {
+				v_compare[0] = v_compare[1];
+				v_compare[1] = total_voltage;
+			}
+			v_difference = v_compare[1] - v_compare[0];
+		}
+
+		//v_factor used to detect short term voltage increases. v_difference detects smaller, longer term voltage changes
+		if (v_factor > 1.0005 || v_difference > 0.0002){
+			charge_status = CHARGING; //Needs to be tested properly. Christian said it turned on display by itself probably due to this
+		}
+		else {
+			charge_status = NOT_CHARGING;
+			charge_flag = 0;
+		}
+
+		//enter this if statement once at beginning of charge and populate initial comparison
+		if (charge_status == CHARGING && !charge_flag) {
+			clk->setup_timer(check_charging_timer_nr,
+					check_charging_timer_duration);
+			v_compare[0] = total_voltage;
+			v_difference = 0.1; //some value greater than 0 to force charge state for first triggering of charge state
+			charge_flag = 1;
+		}
+	}
+
+//	debug_print("\nv_factor: " + std::to_string(v_factor) + "\n\r");
+//	debug_print("\rcharging status: " + std::to_stri	ng(charge_status) + "\n\r");
+}
+#endif // check_charging_status() // #ifdef CKL_DEBUG_CHARGER
+
+void Balance_Master::correct(uint8_t n) {
+	//changed from a mean filter to median filter due to occasional wrong readings triggering error state
+	adr(n);
+	uint8_t ov_sum = 0, uv_sum = 0, ow_sum = 0;
+	float v_sum = 0.0;
+	for (uint8_t i = 0; i < hist_len; i++) {
+		v_sum += cells_array[chip_n][cell_n].v_raw[i];
+		ov_sum += cells_array[chip_n][cell_n].OV[i];
+		uv_sum += cells_array[chip_n][cell_n].UV[i];
+		ow_sum += cells_array[chip_n][cell_n].OW[i];
+		cells_array[chip_n][cell_n].v_median[i] =
+				cells_array[chip_n][cell_n].v_raw[i];
+	}
+
+	//set flag if there are at least 2 flags in history
+	cells_array[chip_n][cell_n].ov_corrected = (ov_sum >= 2);
+	cells_array[chip_n][cell_n].uv_corrected = (uv_sum >= 2);
+	cells_array[chip_n][cell_n].ow_corrected = (ow_sum >= 2);
+
+	//corrected voltage is median value of 5 measurements
+	qsort(cells_array[chip_n][cell_n].v_median, hist_len, sizeof(float),
+			cmpfunc); //sort values into ascending order
+
+	//find the median value and set it to the corrected cell reading
+	if (hist_len % 2 == 0) {
+		cells_array[chip_n][cell_n].v_corrected =
+				cells_array[chip_n][cell_n].v_median[(hist_len - 1) / 2];
+	} else
+		cells_array[chip_n][cell_n].v_corrected =
+				cells_array[chip_n][cell_n].v_median[(hist_len) / 2];
+}
+
+void Balance_Master::set_offset(uint8_t n, float offset) {
+	adr(n); //decode address
+	cells_array[chip_n][cell_n].v_offset = offset;
+}
+
+float Balance_Master::get_offset(uint8_t n) {
+	adr(n); //decode address
+	return cells_array[chip_n][cell_n].v_offset;
+}
+
+float Balance_Master::get_voltage(uint8_t n, bool t) {
+	adr(n); //decode address
+	if (t)
+		return cells_array[chip_n][cell_n].v_corrected; //corrected
+	return cells_array[chip_n][cell_n].v_raw[0]; //raw
+}
+
+void Balance_Master::standby_mode() {
+	//pauses balancing for all chips before readings taken
+	for (uint8_t i = 0; i < chips; i++) { //for all chips
+		ltc_interface.select_chip(i, cells[i]);
+		ltc_interface.standby();
+	}
+}
+
+void Balance_Master::collect_data() {
+	//collects total voltage, minimum and maximum cell, calcs imbalance
+	//todo collect data should also request external thermometer readings from the thermometer module (which is not implemented)
+	//also collects charge cycle data from the flash memory
+
+	//collect data from ICs
+	for (uint8_t i = 0; i < chips; i++) { //for all chips
+		ltc_interface.select_chip(i, cells[i]);
+		//debug_print("reading IC "+std::to_string(i)+"\n\r");
+
+		bool ok = ltc_interface.read_data();
+
+		if (!ok)
+			debug_print("reading IC " + std::to_string(i) + " failed\n\r");
+		else {
+			//Add in code here for pausing discharging/ balancing
+			for (uint8_t k = 0; k < cells[i]; k++) {
+				push(i, k, ltc_interface.voltage[k], ltc_interface.OV[k],
+						ltc_interface.UV[k], ltc_interface.OW[k]);
+			}
+			temperature[i] = ltc_interface.temperature;
+		}
+	}
+
+	//filter collected data
+	for (uint8_t i = 0; i < total_cells; i++)
+		correct(i);
+
+	//get min, max, total voltage
+	float minv, maxv, totalv;
+	for (uint8_t i = 0; i < total_cells; i++) {
+		float v = get_voltage(i, CORRECTED); //get corrected voltage
+// [CKL] : //To make the summation of cell voltage display in console equal the total voltage displayed (i.e. 3 decimal places)
+/* // removed after debug	
+		char temp[20];
+		std::string debugString="raw   : ";
+		sprintf(temp,"%f", v); //format pack voltage
+		debugString += temp;
+		debugString += "\r\n";
+		debug_print(debugString);
+*/			
+    	v = (int)(v * 1000 + 0.5);
+    	v = (float)v / 1000;		 		
+/* // removed after debug
+		debugString="round : ";
+		sprintf(temp,"%f", v); //format pack voltage
+		debugString += temp;
+		debugString += "\r\n";
+		debug_print(debugString);
+*/			
+// [CKL end]
+		if (i == 0) {
+			minv = v;
+			maxv = v;			
+			totalv = v;
+		} else {
+			minv = (v < minv) ? v : minv;
+			maxv = (v > maxv) ? v : maxv;
+			totalv += v;
+		}
+	}
+
+	//collect flags
+	UV = 0;
+	OV = 0;
+	OW = 0;
+	for (uint8_t i = 0; i < total_cells; i++) {
+		adr(i);
+// [CKL] : to ensure the UV, OV set only if that corresponding cell is really UV, OV respectively. 
+// As it's found in the console debug log that UV, OV are 1, but the cells' voltages are normal.
+// It's strange that the LTC6802 reported the UV, OV wrongly in some occasions		
+		UV |= cells_array[chip_n][cell_n].uv_corrected && cells_array[chip_n][cell_n].v_corrected < charging_low_v_margin;
+		OV |= cells_array[chip_n][cell_n].ov_corrected && cells_array[chip_n][cell_n].v_corrected > charging_high_v_margin;
+//		UV |= cells_array[chip_n][cell_n].uv_corrected;
+//		OV |= cells_array[chip_n][cell_n].ov_corrected;		
+// [CKL end]		
+		OW |= cells_array[chip_n][cell_n].ow_corrected;		
+	}
+
+	//collect voltage stats
+	lowest_cell = minv;
+	highest_cell = maxv;
+	total_voltage = totalv;
+	imbalance = highest_cell - lowest_cell;
+
+	//collect and process external temperatures
+	//thermometer = LMT01.get_temp();
+
+	//process LTC temperatures:
+	float max_t;
+	for (uint8_t i = 0; i < chips; i++) {
+		float t = temperature[i];
+		if (i == 0)
+			max_t = t;
+		else
+			max_t = (max_t > t) ? max_t : t; //find largest LTC temp
+	}
+
+	//compare LTC and ext temps to find highest
+	max_t = (max_t > thermometer) ? max_t : thermometer;
+
+// [CKL] : Add hysteresis for sensing OT. If not already in OT, OT=true only if max_t>65. If already in OT, OT returns to false only if max_t<=60
+	if(!OT){
+		OT = (max_t > LTC_temperature_margin || max_t > ext_thermometer_margin);
+	}else{
+		OT = (max_t > (LTC_temperature_margin-OT_hysteresis) || max_t > (ext_thermometer_margin-OT_hysteresis));
+	}
+// [CKL] END	
+	TF = 0; //todo no thermometer fault (we'll figure this out later)
+
+	//collect total charge cycle data from the flash memory
+	//data is stored in flash as integer percentage and needs to be converted to float
+//	total_cycles =  (read_battery_cycles(address) / (float)100);
+}
+
+// [CKL worklog 22-W21-07 ] : special "force_balance" mode for cell discharging experiment
+#ifdef FORCE_CONT_DISCHARGE
+bool Balance_Master::cell_good_for_discharge(uint8_t adr, int chip) {
+	//Goes through each individual cell and decides if its good for charging
+	if (balance_forbidden)
+		return 0; //balancing has been forbidden
+	if (!ok_to_balance)
+		return 0; //balancing is not generally allowed
+	if (startup_phase)
+		return 0; //no balancing while in startup
+
+	bool override = 0;
+	for (uint8_t i = 0; i < total_cells; i++)
+		override |= balancing_override[i]; //check if override active	
+		
+	if(override){
+		return balancing_override[adr]; //manually forced
+	}
+	else{	
+		if (cooldown_phase)
+			return 0; //no balancing while in cooldown
+		if (adr >= total_cells)
+			return 0; //out of range
+		if (cell_switch_phase == 0 && adr % 2 == 1)
+			return 0; //evens phase and odd cell,  phase 1 and phase 2 cell
+		if (cell_switch_phase == 1 && adr % 2 == 0)
+			return 0; //odds phase and even cell,  phase 2 and phase 1 cell
+		else
+			return balance_decision[adr]; //slated for balance	
+	}
+}
+#else
+bool Balance_Master::cell_good_for_discharge(uint8_t adr, int chip) {
+	//Goes through each individual cell and decides if its good for charging
+	if (balance_forbidden)
+		return 0; //balancing has been forbidden
+	if (!ok_to_balance)
+		return 0; //balancing is not generally allowed
+	if (startup_phase)
+		return 0; //no balancing while in startup
+	if (cooldown_phase)
+		return 0; //no balancing while in cooldown
+	if (adr >= total_cells)
+		return 0; //out of range
+	if (cell_switch_phase == 0 && adr % 2 == 1)
+		return 0; //evens phase and odd cell,  phase 1 and phase 2 cell
+	if (cell_switch_phase == 1 && adr % 2 == 0)
+		return 0; //odds phase and even cell,  phase 2 and phase 1 cell
+	bool override = 0;
+	for (uint8_t i = 0; i < total_cells; i++)
+		override |= balancing_override[i]; //check if override active
+	if (override)
+		return balancing_override[adr]; //manually forced
+	else
+		return balance_decision[adr]; //slated for balance
+}
+#endif
+// [CKL worklog 22-W21-07 end ]
+
+void Balance_Master::order_balancing() {
+	int chip_no = 0;
+	for (uint8_t i = 0; i < chips; i++) { //for all chips
+		chip_no = i;
+		ltc_interface.select_chip(i, cells[i]); //chip select
+		for (uint8_t j = 0; j < 12; j++) //for all cells
+			ltc_interface.balancing[j] =
+					(j < cells[i]) ?
+							cell_good_for_discharge(adr(i, j), chip_no) : 0;
+
+		//Test code to force balancing on specific cells
+//		 if (i == 0 && cooldown_phase == 0){
+//		 ltc_interface.balancing[0] = 0; //EDIT
+//		 ltc_interface.balancing[1] = 0;
+//		 ltc_interface.balancing[2] = 0;
+//		 ltc_interface.balancing[3] = 1;
+//		 ltc_interface.balancing[4] = 1;
+//		 ltc_interface.balancing[5] = 0;
+//		 ltc_interface.balancing[6] = 0;
+//		 ltc_interface.balancing[7] = 0;
+//		 }
+
+		ltc_interface.select_chip(i, cells[i]); //select chip
+		ltc_interface.balance(); //order chip balance
+	}
+}
+
+void Balance_Master::balancing_done() {
+	//if balancing is completed, turn off LV side
+	if (is_balanced) {
+// [CKL] : turn off LV side should be done by calling		
+//		order_shutdown();
+		PIC_shutdown_communication();
+// [CKL end]
+	}
+}
+
+void Balance_Master::order_shutdown() {
+	ltc_interface.select_chip(1, cells[1]); //select chip
+	ltc_interface.shutdown();
+	HAL_Delay(52); //the circuit would switch off between 45ms and 72ms, 52ms should be safe
+	ltc_interface.standby();
+}
+
+bool Balance_Master::cell_switch_timeout() {
+	uint8_t N = cell_switch_timer_nr;
+	bool to = clk->timed_out(N); //check for timeout
+	if (to) { //timed out
+		clk->clear_flag(N); //manual clear
+		cell_switch_phase = !cell_switch_phase; //flip cells
+	}
+	return to; //return timeout flag
+}
+
+bool Balance_Master::cooldown_timeout() {
+	uint8_t N = cooldown_timer_nr;
+	bool to = clk->timed_out(N); //check for timeout
+	if (to) { //timed out
+		clk->clear_flag(N); //manual clear flag
+		cooldown_phase = !cooldown_phase; //flip phase
+		uint32_t dur =
+				cooldown_phase ?
+						cooldown_timer_cooldown_duration :
+						cooldown_timer_discharge_duration;
+		clk->setup_timer(N, dur); //setup with correct delay
+	}
+	return to; //return timeout flag
+}
+
+bool Balance_Master::communication_timeout() {
+	uint8_t N = communication_timer_nr;
+	bool to = clk->timed_out(N); //check for timeout
+	if (to) { //timed out
+		clk->clear_flag(N); //manual clear flag
+	}
+	return to; //return timeout flag
+}
+
+bool Balance_Master::check_charging_timeout() {
+	uint8_t N = check_charging_timer_nr;
+	bool to = clk->timed_out(N); //check for timeout
+	if (to) { //timed out
+		clk->clear_flag(N); //manual clear flag
+	}
+	return to; //return timeout flag
+}
+
+bool Balance_Master::startup_timeout() {
+	uint8_t N = startup_timer_nr;
+	bool to = clk->timed_out(N); //check for timeout
+	if (to) { //timed out
+		clk->stop_timer(N); //stop timer
+		startup_phase = 0; //not in startup anymore
+	}
+	return to; //return timeout flag
+}
+
+bool Balance_Master::shutdown_timeout() {
+	uint8_t N = shutdown_timer_nr;
+	bool to = clk->timed_out(N); //check for timeout
+	if (to) { //if timed out
+//		clk->stop_timer(N); //stop timer
+		LV_shutdown = true;
+// [CKL] : turn off LV side should be done by calling		
+//		order_shutdown();
+		PIC_shutdown_communication();
+// [CKL end]
+	}
+	return to; //return timeout flag
+}
+
+bool Balance_Master::monitoring_timeout() {
+	uint8_t N = monitoring_timer_nr;
+	bool to = clk->timed_out(N); //check for timeout
+	if (to) { //if timed out
+		clk->stop_timer(N); //stop timer
+		monitoring = 0;
+	}
+	return to; //return timeout flag
+}
+
+void Balance_Master::setup_monitoring_timer() {
+	clk->setup_timer(monitoring_timer_nr, monitoring_timer_duration);
+}
+
+void Balance_Master::init(SPI_HandleTypeDef h1, Clock *c, Thermometer *t,
+		Display *dis, RTC_HandleTypeDef _hrtc) {
+	clk = c; //get clock reference
+	thrm = t; //get thermometer reference
+	dsp = dis;
+	spi_ltc = h1; //SPI reference
+	hrtc = _hrtc;
+
+	ltc_interface.init(136, 208, h1);
+
+	//request timer numbers
+	cell_switch_timer_nr = clk->CELL_SWITCH;
+	cooldown_timer_nr = clk->COOLDOWN;
+	communication_timer_nr = clk->COMMUNICATION;
+	startup_timer_nr = clk->STARTUP;
+	shutdown_timer_nr = clk->SHUTDOWN;
+	check_charging_timer_nr = clk->CHECK_CHARGING;
+	monitoring_timer_nr = clk->MONITOR_DATA;
+
+	OT = 0;
+	TF = 0;
+	UV = 0;
+	OV = 0;
+	OW = 0; //flags
+	ok_to_charge = 0;
+	ok_to_balance = 1;
+	is_balancing = 0;
+
+// [CKL worklog 22-W11-07]
+	fForceChargerOff = false;
+// [CKL end]	
+
+	imbal_count = 0;
+	temp_error = 0;
+	lv_error = 0;
+	imbal_error = 0;
+	fault_error = 0;
+
+	chip_n = 0, cell_n = 0;
+	imbalance = 0.0;
+	lowest_cell = 0.0;
+	highest_cell = 0.0;
+	total_voltage = 0.0;
+	DE = 0;
+	CE = 1;
+	is_balanced = 0;
+	button_state = 0;
+	last_button_state = 0;
+	total_shutdown = false;
+	LV_shutdown = false;
+	iterate = 0;
+	monitoring = 0;
+	charge_flag = 0;
+	v_difference = 0;
+	v_factor = 0;
+	charge_start = false;
+#ifdef RECORD_CHARGING_CYCLE	
+	total_charged = 0 ;
+	timespan_whole = 0;
+	initial_start_charge_percentage = INVALID_CHARGE_PERCENTAGE;
+
+	total_cycles = (float)FlashRead<uint32_t>(USER_PARA_FLASH+OFFSET_ACC_CYCLE_COUNT);
+	if(total_cycles == 0xFFFFFFFF) total_cycles=0;
+
+	total_cycles = total_cycles / 100.0f;
+#endif	// #ifdef RECORD_CHARGING_CYCLE	
+	address = 0x080FF800; //0x080FF800 The start of the last page in STM32L496RGT3 flash memory
+
+
+	balance_forbidden = 0; //balance override
+
+	for (uint8_t i = 0; i < total_cells; i++) {
+		balance_decision[i] = 0; //cells picked for balancing
+		balancing_override[i] = 0; //cell balancing override
+	}
+	for (uint8_t i = 0; i < chips; i++)
+		temperature[i] = 0.0; //LTC chips, naming is confusing, to_fix
+
+	cell_data blank;
+	for (uint8_t i = 0; i < hist_len; i++) {
+		blank.v_raw[i] = 0.0;
+		blank.OV[i] = 0;
+		blank.UV[i] = 0;
+		blank.OW[i] = 0;
+	}
+	blank.v_offset = 0.0;
+	blank.v_corrected = 0.0;
+	blank.ov_corrected = 0;
+	blank.uv_corrected = 0;
+	blank.ow_corrected = 0;
+	for (uint8_t i = 0; i < chips; i++)
+		for (uint8_t j = 0; j < 12; j++)
+			cells_array[i][j] = blank;
+
+	cell_switch_phase = 0; //0 for evens
+	cooldown_phase = 0; //0 for discharge
+	startup_phase = 1; //1 for startup
+	error_code = 0; //0 for no error
+	charge_state = 0; //0 for low
+
+	//setup timers
+	clk->setup_timer(startup_timer_nr, startup_timer_delay);
+	clk->setup_timer(shutdown_timer_nr, shutdown_timer_delay);
+	clk->setup_timer(communication_timer_nr, communication_timer_interval);
+	clk->setup_timer(cooldown_timer_nr, cooldown_timer_discharge_duration);
+	clk->setup_timer(cell_switch_timer_nr, cell_switch_timer_delay);
+	clk->setup_timer(check_charging_timer_nr, check_charging_timer_duration);
+
+//	static FLASH_EraseInitTypeDef EraseInitStruct;
+//	uint32_t PAGEError;
+//
+//	EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
+//	EraseInitStruct.Banks = 2;
+//	EraseInitStruct.Page = 255;
+//	EraseInitStruct.NbPages = 1;
+//
+//	address = 0x080FF800;
+//	if (HAL_FLASHEx_Erase(&EraseInitStruct, &PAGEError) != HAL_OK){
+//	 /*Error occurred while page erase.*/
+//		//print some error code here?
+//		HAL_FLASH_GetError ();
+//	}
+//	while(1);
+}
+
+void Balance_Master::work() {
+	static uint8_t delayChargingCheck=0;
+
+	uint8_t charge_percentage;
+	cell_switch_timeout(); //check for switch timeout
+	cooldown_timeout(); //check for cooldown timeout
+	startup_timeout(); //check for startup timeout
+	shutdown_timeout(); //check for shutdown timeout
+	monitoring_timeout(); //check BMS data monitoring timeout
+	////// need collect_data() to get correct temps /////
+	//collect_data();
+	thermometer = LMT01.get_temp(); //this function called every loop iteration to allow accurate reading of temperatures
+
+	if (communication_timeout()) { //check for communications timeout
+		if(delayChargingCheck<8) delayChargingCheck++;
+		standby_mode(); //set chips into standby mode and pause all cell balancing
+		collect_data();
+		if(delayChargingCheck >= 8) check_charging_status(); //work out whether battery is being charged
+		make_balance_decision(); //handle decisions
+		if(delayChargingCheck >= 3) make_charge_decision();
+		assemble_error_code();
+		order_balancing(); //order balancing
+		balancing_done(); //turn off LV side when balancing is done
+	}
+	charge_percentage = get_charge_percentage();
+//	if(charge_status==1){
+//		debug_print("CKL: CHARGING !!!!\n\r");	
+//	}
+	// [FF 2023.10.03]
+//	dsp->push_state(error_code, charge_percentage, press_type, charge_status);
+	dsp->push_state( error_code, charge_percentage, press_type, is_charger_existed ? charge_stat_fr_charger : charge_status );
+	// [FF End]
+	calculate_button_press(); //function to check whether HV side button has been pressed
+	if (dsp->Charge_display_timeout() || total_shutdown) { //this allows charge percentage / errors to be displayed before shutdown
+		PIC_shutdown_communication();
+	}
+
+//	charge_percentage = 30;
+//	charge_status = CHARGING;
+//	charge_start = false;
+
+	//this if else statement triggers at the start and end of charge detection
+	//used to write charge cycle data to the flash memory
+	// [FF 2023.10.03]
+	bool _tmp_stat = is_charger_existed ? charge_stat_fr_charger : charge_status;
+	if ( _tmp_stat == CHARGING && charge_start == false && total_voltage != 0.0 ) {
+		charge_start = true; // variable used to indicate the start and end of a battery charge
+		// [FF END]
+
+//		calculate_battery_cycles(charge_percentage);
+//		//TEST CODE//
+//		charge_start = false;
+//		calculate_battery_cycles(charge_percentage);
+//		/////////////
+#ifdef RECORD_CHARGING_CYCLE
+		if( initial_start_charge_percentage == INVALID_CHARGE_PERCENTAGE || initial_start_charge_percentage == 0 ){			// at the bootup time,
+			uint8_t string[6];
+
+			sprintf((char*)string, "%05.2f", total_voltage);
+			StringTo4HexDigit(string,initial_start_charge_voltage);
+
+			initial_start_charge_percentage=charge_percentage;
+
+			char	buf[50];
+			sprintf(buf,"\r\nStart charing: %d\r\n\n\n",charge_percentage);
+			debug_print(buf);
+
+//			start_charge_percentage=charge_percentage;
+			timespan_start=HAL_GetTick();
+		}
+#endif	// #ifdef RECORD_CHARGING_CYCLE		
+
+	} else if ( _tmp_stat == NOT_CHARGING && charge_start == true) {
+		charge_start = false;
+//		calculate_battery_cycles(charge_percentage);
+#if 0
+#ifdef RECORD_CHARGING_CYCLE
+		total_charged += (charge_percentage - start_charge_percentage);
+		timespan_whole += (HAL_GetTick() - timespan_start);
+#endif
+#endif	// #ifdef RECORD_CHARGING_CYCLE
+	}
+}
+
+//void Balance_Master::calculate_battery_cycles(uint8_t battery_pct){
+//	if (charge_start == true) start_charge_percentage = battery_pct; //start of the charging detected
+//	else if (charge_start == false){ //end of charging detected
+//		uint64_t stored_value;
+//		total_charged = (battery_pct - start_charge_percentage); total_charged = 30; //calculates battery percentage increase over a charge period
+//		stored_value = read_battery_cycles(address); //reads the stored charge percentage from flash
+//		if (stored_value == 0xFFFFFFFFFFFFFFFF) stored_value = 0; //0 is stored in flash as 0xFFFFFFFFFFFFFFFF
+//		total_charged += stored_value; //add the calculated percentage to stored percentage
+//		write_battery_cycles(address, total_charged); //write this new value to flash memory
+//		debug_print("writing to flash...");
+//		debug_print("total_charged "+std::to_string(total_charged) +"\n\r");
+//	}
+//}
+//
+//void Balance_Master::write_battery_cycles(uint32_t start_page_address, uint64_t cycles){
+//	static FLASH_EraseInitTypeDef EraseInitStruct;
+//	uint32_t PAGEError;
+//
+//	HAL_FLASH_Unlock();
+//
+//	if (start_page_address == 0x08100000){
+//		//this designates the flash memory page to erase
+//		EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
+//		EraseInitStruct.Banks = 2;
+//		EraseInitStruct.Page = 255;
+//		EraseInitStruct.NbPages = 1;
+//
+//		address = 0x080FF800;
+//		if (HAL_FLASHEx_Erase(&EraseInitStruct, &PAGEError) != HAL_OK){
+//		 /*Error occurred while page erase.*/
+//			//print some error code here?
+//			HAL_FLASH_GetError ();
+//		}
+//	}
+//	address = 0x080FF82C;
+//
+//	//for some reason this isn't writing to the flash memory anymore
+//	//not too sure why
+//	HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, address, (uint64_t) cycles);
+//
+//	HAL_FLASH_Lock();
+//	//use 0x080FF800 as address. This is first address of last page. 0x080FF800 - 0x08100000 is the address range of last page
+//}
+//
+//uint64_t Balance_Master::read_battery_cycles(uint32_t start_page_address){
+//	uint64_t rx_cycles=0;
+//	uint64_t largest_rx_cycles=0;
+//
+//	while(start_page_address < 0x08100000){
+//		rx_cycles = *(__IO uint64_t*)start_page_address;
+//		if (rx_cycles == 0xFFFFFFFFFFFFFFFF) {
+//			if (start_page_address != 0x080FF800) {
+//				start_page_address -= 8;
+//				largest_rx_cycles = *(__IO uint64_t*)start_page_address;
+//			}
+//			else largest_rx_cycles = 0;
+//			break;
+//		}
+//		else start_page_address += 8;
+//
+//		address = start_page_address;
+//		if (rx_cycles > largest_rx_cycles) {
+//			largest_rx_cycles = rx_cycles;
+//		}
+//	}
+//
+//	return largest_rx_cycles;
+//}
+
+void Balance_Master::make_charge_decision() {
+	ok_to_charge = 1; //assume it's ok, then cancel if something is not
+	if (OT) {
+		ok_to_charge = 0; //if got overtemperature flag (something overheated)
+		temp_error = 1;
+	}
+	if (TF) {
+		ok_to_charge = 0; //if got thermometer fault (something wrong with readings)
+		temp_error = 1;
+	}
+	if (OV)
+		ok_to_charge = 0; //if got overvoltage flag (spikes that are not seen in filtered readings)
+	if (OW) {
+		ok_to_charge = 0; //if detected open wire
+		fault_error = 1;
+	}
+	if (lowest_cell < charging_low_v_margin) {
+		ok_to_charge = 0; //if min cell voltage too low
+		fault_error = 1;
+	}
+	if (highest_cell > charging_high_v_margin)
+		ok_to_charge = 0; //if max cell to high
+	if (imbalance > charging_imbalance_margin) {
+		imbal_count += 1;
+
+		if (imbal_count >= 5){
+			ok_to_charge = 0; //if imbalance too great
+			imbal_error = 1;
+		}
+	}else imbal_count = 0;
+}
+
+void Balance_Master::make_balance_decision() {
+	//this decides if it is ok to balance
+	ok_to_balance = 1; //assume it's ok, then cancel if something is not
+	if (OT) {
+		ok_to_balance = 0; //if got overtemperature flag (something overheated)
+		temp_error = 1;
+	}
+	if (TF) {
+		ok_to_balance = 0; //if got thermometer fault (something wrong with readings)
+		temp_error = 1;
+	}
+	if (UV) {
+		ok_to_balance = 0; //if got overvoltage flag (spikes that are not seen in filtered readings)
+		lv_error = 1;
+	}
+	if (OW) {
+		ok_to_balance = 0; //if detected open wire
+		fault_error = 1;
+	}
+	if (lowest_cell < balance_low_cell_voltage
+			&& dsp->Charge_display_timeout()) {
+		ok_to_balance = 0; //if min cell too low
+		lv_error = 1;
+		total_shutdown = true;
+		// [CKL debug]
+		debug_print("lowest_cell too low: " + std::to_string(lowest_cell) + "\n\r");
+	}
+	if (total_voltage < total_battery_low_voltage
+			&& dsp->Charge_display_timeout()) {
+		ok_to_balance = 0;
+		total_shutdown = true;
+		// [CKL debug]
+		debug_print("total_voltage too low: " + std::to_string(total_voltage) + "\n\r");
+	}
+
+//	if (imbalance < balance_low_stop_v_margin) ok_to_balance = 0; //cancel balancing on min imbalance
+//	if (imbalance > balance_high_stop_v_margin) ok_to_balance = 0; //cancel balancing on max imbalance
+
+	//this decides if the balancing should be done (+hysteresis filter)
+	if(!startup_phase){
+		if (!ok_to_balance)
+			is_balancing = 0; //if not ok to balance - stop it!
+		else{
+			if(is_balancing == 0){
+				if(imbalance >= balance_hysteresis_v_margin){
+					is_balancing = 1; //above threshold - start balancing	
+				}
+			}
+			else{
+				if(imbalance <= balance_low_stop_v_margin){
+					is_balancing = 0;	// below hysteresis threshold -> stop balancing
+				}
+			}
+		}
+	}
+
+// [CKL bugfix] : when 10mV<imbal<20mV, the LV can't shutdown properly. Fixed in version "v1.0 (L412 pre-v3.1 RC1)" or later
+	// [FF 2023.10.03]
+	bool _tmp_stat = is_charger_existed ? charge_stat_fr_charger : charge_status;
+//	if(!charge_status && total_voltage >= 5 && dsp->Charge_display_timeout()){
+	if( _tmp_stat == false && total_voltage >= 5 && dsp->Charge_display_timeout() ){
+	// [FF End]
+		if(is_balancing == 0 /*&& imbalance < balance_hysteresis_v_margin*/){
+			is_balanced = 1; //5 volt minimum to stop bms thinking its balanced with no battery
+			if(!monitoring) ok_to_balance = 0;
+			LV_shutdown = true;
+		}
+		else if(is_balancing == 1 /*&& imbalance < balance_low_stop_v_margin*/){
+			is_balanced = 1; //5 volt minimum to stop bms thinking its balanced with no battery
+			if(!monitoring) ok_to_balance = 0;
+			is_balancing = 0;
+			LV_shutdown = true;			
+		}
+		else{
+			LV_shutdown = false;
+		}
+	}
+	else{
+		LV_shutdown = false;
+	}
+
+
+/*
+	if (imbalance < balance_low_stop_v_margin && !charge_status
+			&& total_voltage >= 5 && dsp->Charge_display_timeout()) {
+		is_balanced = 1; //5 volt minimum to stop bms thinking its balanced with no battery
+		if(!monitoring) ok_to_balance = 0;
+		is_balancing = 0;
+		LV_shutdown = true;
+	} else
+		LV_shutdown = false;
+*/
+// [CKL end]
+
+	//this picks cells for balancing
+	float low_v;
+	if(is_balancing){
+		low_v= lowest_cell + balance_low_stop_v_margin; // min voltage + balance margin
+	}
+	else{
+		low_v= lowest_cell + balance_hysteresis_v_margin;
+	}
+	for (uint8_t i = 0; i < total_cells; i++) //for each cell
+		balance_decision[i] = (get_voltage(i, CORRECTED) >= low_v); //mark cells above balance
+	//todo more advanced selection algorithm with cell count selection - aleks4
+
+//	if (imbalance < balance_low_stop_v_margin && total_voltage >= 5 && !charge_status && dsp->Charge_display_timeout()){
+//		is_balanced = 1; //5 volt minimum to stop bms thinking its balanced with no battery
+//		LV_shutdown = true;
+//	}
+//	else LV_shutdown = false;
+}
+
+void Balance_Master::assemble_error_code() {
+	//set of rules that defines how error code is constructed
+	error_code = 0;
+	if (!ok_to_balance && !is_balanced)
+		error_code |= 1; //added is balanced variable to stop errors when battery is balanced
+	if (!ok_to_charge)
+		error_code |= 2;
+}
+// [FF 2023.09.26] enhanced get percentage
+uint8_t Balance_Master::get_charge_percentage() {
+	return calc_charge_percentage(total_voltage);
+}
+
+uint8_t Balance_Master::get_charge_percentage(float _volt) {
+	return calc_charge_percentage(_volt);
+}
+#ifdef SURVICE_VERSION
+uint8_t Balance_Master::calc_charge_percentage(float _volt) {
+	//This percentage calculation only works with T150 batteries
+	uint8_t percentage;
+	
+	if(_volt < 46.90) percentage = 0;
+	else if(_volt >= 46.9 && _volt <= 58.52){
+		percentage = (((_volt - 46.90) / (58.52 - 46.90)) * 100);
+	}
+	else percentage = 100;
+
+	return percentage;
+}
+#else
+uint8_t Balance_Master::calc_charge_percentage(float _volt) {
+	//This percentage calculation only works with T150 batteries
+	uint8_t percentage;
+	if (_volt < 35)
+		percentage = 0;
+	else if (_volt >= 35 && _volt <= 43.82) { //2.5V - 3.13V 63mV/1%
+		percentage = (((_volt - 35) / (43.82 - 35)) * 10);
+	} else if (_volt > 43.82 && _volt <= 47.32) { //3.13V - 3.38V 25mV/1%
+		percentage = 10 + (((_volt - 43.82) / (47.32 - 43.82)) * 10);
+	} else if (_volt > 47.32 && _volt <= 58.52) { //3.38V - 4.18V 10mV/1%
+		percentage = 20 + (((_volt - 47.32) / (58.52 - 47.32)) * 80);
+	} else if (_volt > 58.52)
+		percentage = 100;
+	return percentage;
+}
+#endif
+// [FF End]
+
+void Balance_Master::calculate_button_press() {
+	const uint16_t long_press_duration = 5000; 	// > 5 seconds
+	const uint16_t short_press_duration = 50;	// > 100ms : Avoid the LCD is turned on due to noise/glitch on the button switch [CKL worklog 22-W39-06]
+	// [FF 2023.10.05]
+	const uint16_t unpress_duration = 1000;
+	// [FF End]
+
+	last_button_state = button_state;
+	ltc_interface.select_chip(0, cells[0]);
+	button_state = ltc_interface.check_button_press();
+//	debug_print("button state: "+std::to_string(button_state)+"\n\r"); //USED FOR DEBUGGING
+#if 1
+// Avoid the LCD is turned on due to noise/glitch on the button switch [CKL worklog 22-W39-06]
+	if (button_state != last_button_state) {
+		if (!button_state)
+			button_pressed_time = HAL_GetTick();
+		else {
+			// [FF 2023.10.05]
+			button_unpressed_time = HAL_GetTick();
+			// [FF End]
+			uint32_t temp = (HAL_GetTick() - button_pressed_time);
+			if (short_press_duration <= temp  && temp <= long_press_duration) {
+//				press_type = SHORT; //short press (less than 5 seconds but longer than 100ms)
+				// [FF 2023.10.05]
+				pressed_cnt ++;
+				if( pressed_cnt == 3 ){ // press 3 times with interval less than 1s
+					if( is_discharging_monitor == false ){
+						press_type = DISCHA;
+						is_discharging_monitor = true;
+						balance_forbidden = true;
+					}
+					else{
+						press_type = SHORT;
+						is_discharging_monitor = false;
+						balance_forbidden = false;
+					}
+				}
+				else if( pressed_cnt == 5 ){ // press 5 times to display the dump log, flag reset in interface.cpp
+					press_to_dump_log = true;
+				}
+				else{
+					if( is_discharging_monitor == false ) press_type = SHORT;
+				}
+				// [FF End]
+			}
+			else{
+				// [FF 2023.10.05]
+				if( is_discharging_monitor == false ) press_type = INACTIVE;
+				// [FF End]
+			}
+
+		}
+	}
+	else{
+		if (HAL_GetTick() - button_pressed_time > long_press_duration
+			&& !button_state) {
+			if( is_discharging_monitor == false ){
+				press_type = LONG;
+				monitoring = 0; //reset monitoring mode to ensure BMS turns off
+				total_shutdown = true;
+				dsp->set_display(4); //4 corresponds to shutdown display
+				HAL_Delay(3000); //3 second display showing 'OFF' message
+				while (!button_state) {
+					button_state = ltc_interface.check_button_press();
+				}
+			}
+			else{
+				debug_print("\r\n Entering Standby Mode ... \r\n ");
+				__HAL_PWR_CLEAR_FLAG( PWR_FLAG_WU );
+				__HAL_RTC_WAKEUPTIMER_CLEAR_FLAG( &hrtc, RTC_FLAG_WUTF );
+
+				HAL_PWR_EnableWakeUpPin( PWR_WAKEUP_PIN5 );
+				// PWR->CR2 |= 0x01; same as following code statement;
+//				HAL_PWR_CLEAR_WAKEUP_FLAG( PWR_WAKEUP_PIN5_FLAG ); // this not appliable in STM32L412
+				dsp->set_display(7); // display standby mode
+				HAL_Delay(3000); //3 second display showing 'standby' message#
+				dsp->set_display(2);
+				if( HAL_RTCEx_SetWakeUpTimer_IT( &hrtc, 30-1, RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0 ) != HAL_OK ){
+					debug_print("\r\n Something went wrong when setting up RTC wake up ... \r\n ");
+				}
+				HAL_SuspendTick();
+				HAL_PWR_EnterSTANDBYMode( );
+//				HAL_PWREx_EnterSHUTDOWNMode();
+			}
+		} 
+		else{
+			if( is_discharging_monitor == false ) press_type = INACTIVE;
+			if( pressed_cnt > 0 ){
+				if( HAL_GetTick() - button_unpressed_time > unpress_duration ) pressed_cnt = 0;
+			}
+		}
+	}
+#else
+	if (button_state != last_button_state) {
+		if (!button_state)
+			button_pressed_time = HAL_GetTick();
+		else {
+			if (HAL_GetTick() - button_pressed_time <= long_press_duration) {
+				press_type = SHORT; //short press (less than 5 seconds)
+			}
+		}
+	} else if (HAL_GetTick() - button_pressed_time > long_press_duration
+			&& !button_state) {
+		press_type = LONG;
+		monitoring = 0; //reset monitoring mode to ensure BMS turns off
+		total_shutdown = true;
+		dsp->set_display(4); //4 corresponds to shutdown display
+		HAL_Delay(3000); //3 second display showing 'OFF' message
+		while (!button_state) {
+			button_state = ltc_interface.check_button_press();
+		}
+	} else
+		press_type = INACTIVE;
+#endif
+}
+
+void Balance_Master::PIC_shutdown_communication() {
+	//total_shutdown = 0;
+	//LV_shutdown = 0;
+
+	if ((total_shutdown || LV_shutdown) && !monitoring) {
+		uint8_t half_period;
+		uint32_t signal_start;
+		bool gpio1 = 1;
+
+#if 0
+			for (uint8_t i=0; i<bm->chips; i++){ //LTC temperatures
+				sprintf(temp,"%05.1f", bm->temperature[i]);
+				block+=temp;
+				block+=" ";
+			}
+			block+="| board temp: ";
+			sprintf(temp,"%05.1f", bm->thermometer);
+#endif
+
+#ifdef RECORD_CHARGING_CYCLE
+		// [FF 2023.10.10]
+		flash_saving();
+		// [FF End]
+/*		uint8_t	finalChargePercentage=0;
+//		if(charge_start == true){
+		if(initial_start_charge_percentage != INVALID_CHARGE_PERCENTAGE){
+			finalChargePercentage=get_charge_percentage();
+			total_charged += (finalChargePercentage - initial_start_charge_percentage);
+			timespan_whole += (HAL_GetTick() - timespan_start);			
+		}
+
+			char	buf[50];
+			sprintf(buf,"final : %d %d\n\r",initial_start_charge_percentage,finalChargePercentage);
+			debug_print(buf);
+
+		if(finalChargePercentage > initial_start_charge_percentage){
+			uint16_t nRecord;
+			uint32_t temp;
+
+			// (1) update the user parameters in flash
+			FlashReadSector(USER_PARA_FLASH, flash_data_buf.quadword);
+			temp = *((uint32_t*)&flash_data_buf.byte[OFFSET_ACC_CYCLE_COUNT]);
+			if(temp==0xFFFFFFFF) temp=0;
+			total_charged += temp;
+			*((uint32_t*)&flash_data_buf.byte[OFFSET_ACC_CYCLE_COUNT]) = total_charged;
+			nRecord = *((uint16_t*)&flash_data_buf.byte[OFFSET_TOTAL_RECORD_LOGGED]);
+			if(nRecord == 0xFFFF) nRecord = 0;
+			*((uint16_t*)&flash_data_buf.byte[OFFSET_TOTAL_RECORD_LOGGED]) = nRecord+1;
+			FlashWriteSector(USER_PARA_FLASH, flash_data_buf.quadword);
+
+			// log "initial_start_charge_voltage", "final_start_charge_voltage", "timespan_whole"
+			// write a record at the nRecord-th offset (x18) from BATT_LOG_FLASH
+			// (2) append the new record into flash
+			uint8_t string[6];
+			uint8_t final_start_charge_voltage[2];
+			WordType tempBuf;
+			
+			sprintf((char*)string, "%05.2f", total_voltage);
+			StringTo4HexDigit(string,final_start_charge_voltage);
+#if 0
+			final_start_charge_voltage[0] = ((string[0]-'0')&0x0F)<<4;
+			final_start_charge_voltage[0] = (string[1]-'0') | final_start_charge_voltage[0];
+			final_start_charge_voltage[1] = ((string[3]-'0')&0x0F)<<4;
+			final_start_charge_voltage[1] = (string[4]-'0') | final_start_charge_voltage[1];
+#endif
+			FlashReadSector(BATT_LOG_FLASH + (nRecord / BATT_RECORD_PER_SECTOR)*FLASH_SECTOR_SIZE, flash_data_buf.quadword);			
+
+			uint32_t record_start_offset=(nRecord%BATT_RECORD_PER_SECTOR)*BATT_LOG_RECORD_SIZE;
+
+			flash_data_buf.byte[record_start_offset+OFFSET_VOLT_START] = initial_start_charge_voltage[0];
+			flash_data_buf.byte[record_start_offset+OFFSET_VOLT_START+1] = initial_start_charge_voltage[1];
+			flash_data_buf.byte[record_start_offset+OFFSET_VOLT_END] = final_start_charge_voltage[0];
+			flash_data_buf.byte[record_start_offset+OFFSET_VOLT_END+1] = final_start_charge_voltage[1];
+			*((uint32_t*)&flash_data_buf.byte[record_start_offset+OFFSET_TIMESPAN]) = timespan_whole;
+			*((uint32_t*)&flash_data_buf.byte[record_start_offset+OFFSET_CHARGE_COUNT]) = 0;
+			sprintf((char*)string, "%05.2f", temperature[0]);
+			StringTo4HexDigit(string,tempBuf.byte);
+			*((uint16_t*)&flash_data_buf.byte[record_start_offset+OFFSET_TEMP_1]) = tempBuf.word;
+			sprintf((char*)string, "%05.2f", temperature[1]);
+			StringTo4HexDigit(string,tempBuf.byte);			
+			*((uint16_t*)&flash_data_buf.byte[record_start_offset+OFFSET_TEMP_2]) = tempBuf.word;
+			sprintf((char*)string, "%05.2f", thermometer);
+			StringTo4HexDigit(string,tempBuf.byte);				
+			*((uint16_t*)&flash_data_buf.byte[record_start_offset+OFFSET_TEMP_3]) = tempBuf.word;
+
+			FlashWriteSector(BATT_LOG_FLASH + (nRecord / BATT_RECORD_PER_SECTOR)*FLASH_SECTOR_SIZE, flash_data_buf.quadword);
+			// [FF 2023.10.09]
+			initial_start_charge_percentage = finalChargePercentage;
+			// [FF End]
+		}*/
+#endif	// #ifdef RECORD_CHARGING_CYCLE
+
+		ltc_interface.shutdown();
+		if (total_shutdown){
+			half_period = 200;
+			debug_print("Total shutdown");
+		}else if (LV_shutdown) {
+			half_period = 60;
+			debug_print("LV shutdown");
+		}
+		while (1) {
+			//generate the signal for the PIC non stop until turned off
+			//for (int i=0; i<pulse_transitions; i++){
+			//debug_print("\n\rHere");
+			signal_start = HAL_GetTick();
+
+			if (gpio1 == 1)
+				gpio1 = 0;
+			else
+				gpio1 = 1;
+
+			ltc_interface.select_chip(0, cells[0]);
+			ltc_interface.set_gpio1(gpio1);
+			while ((HAL_GetTick() - signal_start) < half_period)
+				;
+		}
+	}
+}
+// [FF 2023.10.09]
+void Balance_Master::flash_saving()
+{
+	uint8_t	finalChargePercentage = 0;
+
+	if( initial_start_charge_percentage != INVALID_CHARGE_PERCENTAGE ) finalChargePercentage = get_charge_percentage( );
+	else return;
+
+	bool not_save_charging = false;
+	if( is_discharging_monitor == true && finalChargePercentage < initial_start_charge_percentage ) not_save_charging = true;
+	else total_charged += ( finalChargePercentage - initial_start_charge_percentage );
+
+	timespan_whole += (HAL_GetTick() - timespan_start);
+
+	char	buf[50];
+	sprintf(buf,"Final saving : %d %d\n\r", initial_start_charge_percentage, finalChargePercentage);
+	debug_print(buf);
+
+	if( finalChargePercentage != initial_start_charge_percentage ){
+		uint16_t nRecord;
+		uint32_t temp;
+
+		// (1) update the user parameters in flash
+		FlashReadSector(USER_PARA_FLASH, flash_data_buf.quadword);
+		temp = *((uint32_t*)&flash_data_buf.byte[OFFSET_ACC_CYCLE_COUNT]);
+		if(temp==0xFFFFFFFF) temp=0;
+		total_charged += temp;
+		*((uint32_t*)&flash_data_buf.byte[OFFSET_ACC_CYCLE_COUNT]) = total_charged;
+		nRecord = *((uint16_t*)&flash_data_buf.byte[OFFSET_TOTAL_RECORD_LOGGED]);
+		if(nRecord == 0xFFFF) nRecord = 0;
+		if( not_save_charging == false ){
+			*((uint16_t*)&flash_data_buf.byte[OFFSET_TOTAL_RECORD_LOGGED]) = nRecord+1;
+			FlashWriteSector(USER_PARA_FLASH, flash_data_buf.quadword);
+		}
+
+		// log "initial_start_charge_voltage", "final_start_charge_voltage", "timespan_whole"
+		// write a record at the nRecord-th offset (x18) from BATT_LOG_FLASH
+		// (2) append the new record into flash
+		uint8_t string[6];
+		uint8_t final_start_charge_voltage[2];
+		WordType tempBuf;
+
+		sprintf((char*)string, "%05.2f", total_voltage);
+		StringTo4HexDigit(string,final_start_charge_voltage);
+#if 0
+		final_start_charge_voltage[0] = ((string[0]-'0')&0x0F)<<4;
+		final_start_charge_voltage[0] = (string[1]-'0') | final_start_charge_voltage[0];
+		final_start_charge_voltage[1] = ((string[3]-'0')&0x0F)<<4;
+		final_start_charge_voltage[1] = (string[4]-'0') | final_start_charge_voltage[1];
+#endif
+		FlashReadSector(BATT_LOG_FLASH + (nRecord / BATT_RECORD_PER_SECTOR)*FLASH_SECTOR_SIZE, flash_data_buf.quadword);
+
+		uint32_t record_start_offset=(nRecord%BATT_RECORD_PER_SECTOR)*BATT_LOG_RECORD_SIZE;
+
+		flash_data_buf.byte[record_start_offset+OFFSET_VOLT_START] = initial_start_charge_voltage[0];
+		flash_data_buf.byte[record_start_offset+OFFSET_VOLT_START+1] = initial_start_charge_voltage[1];
+		flash_data_buf.byte[record_start_offset+OFFSET_VOLT_END] = final_start_charge_voltage[0];
+		flash_data_buf.byte[record_start_offset+OFFSET_VOLT_END+1] = final_start_charge_voltage[1];
+		*((uint32_t*)&flash_data_buf.byte[record_start_offset+OFFSET_TIMESPAN]) = timespan_whole;
+		*((uint32_t*)&flash_data_buf.byte[record_start_offset+OFFSET_CHARGE_COUNT]) = 0;
+		sprintf((char*)string, "%05.2f", temperature[0]);
+		StringTo4HexDigit(string,tempBuf.byte);
+		*((uint16_t*)&flash_data_buf.byte[record_start_offset+OFFSET_TEMP_1]) = tempBuf.word;
+		sprintf((char*)string, "%05.2f", temperature[1]);
+		StringTo4HexDigit(string,tempBuf.byte);
+		*((uint16_t*)&flash_data_buf.byte[record_start_offset+OFFSET_TEMP_2]) = tempBuf.word;
+		sprintf((char*)string, "%05.2f", thermometer);
+		StringTo4HexDigit(string,tempBuf.byte);
+		*((uint16_t*)&flash_data_buf.byte[record_start_offset+OFFSET_TEMP_3]) = tempBuf.word;
+
+		FlashWriteSector(BATT_LOG_FLASH + (nRecord / BATT_RECORD_PER_SECTOR)*FLASH_SECTOR_SIZE, flash_data_buf.quadword);
+
+		initial_start_charge_percentage = finalChargePercentage;
+	}
+	else return;
+}
+// [FF End]

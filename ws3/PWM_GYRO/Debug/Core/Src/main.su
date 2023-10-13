@@ -1,0 +1,15 @@
+../Core/Src/main.c:91:6:HAL_I2C_MasterRxCpltCallback	16	static
+../Core/Src/main.c:97:6:PWM_send	8	static
+../Core/Src/main.c:104:6:HAL_TIM_PWM_PulseFinishedCallback	16	static
+../Core/Src/main.c:110:19:MPU6050_Init	24	static
+../Core/Src/main.c:140:6:MPU6050_Read_Accel	4	static
+../Core/Src/main.c:156:6:MPU6050_Read_Gyro	4	static
+../Core/Src/main.c:176:5:main	64	static
+../Core/Src/main.c:269:6:SystemClock_Config	88	static
+../Core/Src/main.c:326:13:MX_I2C1_Init	8	static
+../Core/Src/main.c:374:13:MX_TIM1_Init	112	static
+../Core/Src/main.c:454:13:MX_USART3_UART_Init	8	static
+../Core/Src/main.c:489:13:MX_USB_OTG_FS_PCD_Init	8	static
+../Core/Src/main.c:523:13:MX_DMA_Init	16	static
+../Core/Src/main.c:545:13:MX_GPIO_Init	56	static
+../Core/Src/main.c:604:6:Error_Handler	4	static,ignoring_inline_asm

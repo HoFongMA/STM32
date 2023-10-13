@@ -1,0 +1,27 @@
+15:46:54 **** Incremental Build of configuration Debug for project T150_BMS_V8_migration_to_STM32L412 ****
+make -j12 all 
+arm-none-eabi-g++ "../Core/Src/Interface.cpp" -mcpu=cortex-m4 -std=gnu++14 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32L412xx -c -I../Core/Inc -I../Drivers/STM32L4xx_HAL_Driver/Inc -I../Drivers/STM32L4xx_HAL_Driver/Inc/Legacy -I../Drivers/CMSIS/Device/ST/STM32L4xx/Include -I../Drivers/CMSIS/Include -O0 -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -fno-use-cxa-atexit -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Core/Src/Interface.d" -MT"Core/Src/Interface.o" --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -o "Core/Src/Interface.o"
+arm-none-eabi-g++ -o "T150_BMS_V8_migration_to_STM32L412.elf" @"objects.list"   -mcpu=cortex-m4 -T"C:\Users\HoFong\GitFiles\T150_BMS_MainMCU\STM32L412RBTX_FLASH.ld" -Wl,-Map="T150_BMS_V8_migration_to_STM32L412.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -Wl,--start-group -lc -lm -lstdc++ -lsupc++ -Wl,--end-group
+Finished building target: T150_BMS_V8_migration_to_STM32L412.elf
+ 
+arm-none-eabi-size   T150_BMS_V8_migration_to_STM32L412.elf 
+arm-none-eabi-objdump -h -S  T150_BMS_V8_migration_to_STM32L412.elf  > "T150_BMS_V8_migration_to_STM32L412.list"
+arm-none-eabi-objcopy  -O ihex  T150_BMS_V8_migration_to_STM32L412.elf  "T150_BMS_V8_migration_to_STM32L412.hex"
+arm-none-eabi-objcopy  -O binary  T150_BMS_V8_migration_to_STM32L412.elf  "T150_BMS_V8_migration_to_STM32L412.bin"
+   text	   data	    bss	    dec	    hex	filename
+  91184	    520	   7656	  99360	  18420	T150_BMS_V8_migration_to_STM32L412.elf
+Finished building: default.size.stdout
+ 
+Finished building: T150_BMS_V8_migration_to_STM32L412.bin
+Finished building: T150_BMS_V8_migration_to_STM32L412.hex
+ 
+ 
+Finished building: T150_BMS_V8_migration_to_STM32L412.list
+ 
+15:47:03 **** Incremental Build of configuration Debug for project T150_BMS_V8_migration_to_STM32L412 ****
+make -j12 all 
+arm-none-eabi-size   T150_BMS_V8_migration_to_STM32L412.elf 
+   text	   data	    bss	    dec	    hex	filename
+  91184	    520	   7656	  99360	  18420	T150_BMS_V8_migration_to_STM32L412.elf
+Finished building: default.size.stdout
+ 

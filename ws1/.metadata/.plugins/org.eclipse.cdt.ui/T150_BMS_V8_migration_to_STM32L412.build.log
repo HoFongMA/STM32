@@ -1,0 +1,10 @@
+15:47:03 **** Incremental Build of configuration Debug for project T150_BMS_V8_migration_to_STM32L412 ****
+make -j12 all 
+arm-none-eabi-size   T150_BMS_V8_migration_to_STM32L412.elf 
+   text	   data	    bss	    dec	    hex	filename
+  91184	    520	   7656	  99360	  18420	T150_BMS_V8_migration_to_STM32L412.elf
+Finished building: default.size.stdout
+ 
+
+15:47:03 Build Finished. 0 errors, 0 warnings. (took 296ms)
+

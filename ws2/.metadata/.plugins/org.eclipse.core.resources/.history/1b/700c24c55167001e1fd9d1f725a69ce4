@@ -1,0 +1,616 @@
+//Interface.cpp
+//Aleksejs Skorodumovs 08.01.2021
+
+#include "Interface.h"
+#include "UART_FIFO.h"
+#include <cmath>
+
+#include "Debug.h"
+
+#include "flash_user_storage.h"
+#include <string.h>
+//#endif
+
+//INIT
+
+void Interface::init(Clock* c, Balance_Master* b, UART_HandleTypeDef* h) 
+{
+	huart1 = h;
+	clk=c; bm=b; //get references
+	input_array=""; //clear buffers'
+	input_params.clear();
+
+	device_ID=(uint16_t)FlashRead<uint32_t>(USER_PARA_FLASH+OFFSET_DEVICE_ID);
+	if(device_ID==0XFFFF) device_ID=0;
+
+// [CKL worklog 22-W25-03] : device ID in OTP (or hardcoded in program)
+#if 0
+#define AADR_FLASH_OTP_START	((uint32_t)0x1FFF7000)
+#define FLASH_USER_START_ADDR	AADR_FLASH_OTP_START 
+
+typedef union{
+	uint32_t	word;
+	uint16_t	byte16[2];
+	uint8_t		byte[4];
+}WordByte;
+
+	uint32_t Address = 0;
+	__IO WordByte data32;
+	data32.word = 0;
+	Address = FLASH_USER_START_ADDR;
+    data32.word = *(__IO uint32_t*)Address;
+//    data32 = *(__IO uint32_t*)(Address+4);
+	if(data32.byte16[0] != 0xFFFF && device_ID==0){
+		device_ID = data32.byte16[0];
+	}	
+#endif
+// [CKL worklog 22-W25-03 end]
+
+#ifdef SURVICE_VERSION
+	firmware_version = "(ComChargerTest v1)";
+	// firmware_version = "v200";		// successor of the version "v1.0 (L412 v4.2)"
+#else	
+	firmware_version = "v1.0 (L412 v4.3a)";
+//	firmware_version = "v1.0 (L412 v4.3t2)";
+#endif
+	hardware_version = "v8.2";
+	//UART will be initialised in main
+	interface_output_timer_nr=clk->INTERFACE_OUTPUT; //request timer number
+	clk->setup_timer(interface_output_timer_nr, interface_output_interval); //launch timer
+	for (uint8_t i=0; i<disp_blocks; i++) disp[i]=0; //clear display
+	disp[CHARGER_BLOCK]=1; //set charger output
+	// [FF 2023.10.02] Initially with monitoring mode with all data displayed
+	disp[CELL_SUMMARY] = 1;
+	disp[ALL_VOLTAGES] = 1;
+	disp[TEMPERATURES] = 1;
+	disp[BALANCE_LIST] = 1;
+	disp[TIME_N_STATE] = 1;
+	// [FF End]
+}
+
+//INPUT FUNCTIONS
+
+void Interface::input() {
+	if (bytes_left(UART_main)>0) { //if there is unprocessed data
+		char c = (char)pop_rx(UART_main); //pop the char out
+		if (c=='\n'||c=='\r'||c==';') { //command end
+			print(";\n\r"); //loopback char
+			process_message(); //process when encounter cmd end
+			input_array=""; //erase buffer after cmd end
+		} else { //data input
+			push(c); //shift the new char into fifo
+			print(c); //loopback charcxc
+		}
+	}
+}
+
+void Interface::push(char c) { //push character to fifo
+    if (input_array.length()==max_len) input_array.erase(input_array.begin()); //erase first when full
+    input_array+=std::string(1,c); //push back
+    //todo restrict input to printable characters and \n \r service characters
+}
+
+std::string Interface::match(std::string key) { //match command
+    std::size_t adr=input_array.rfind(key); //find last occurrence
+    if (adr!=std::string::npos) { //check if found
+        size_t cmd_sz = input_array.length()-adr; //cmd size to cut out
+        if (adr>0) { //if there is a char before cmd
+            if (input_array[adr-1]!=' ') return ""; //non-space preceeds
+        }
+        if (cmd_sz>key.length()) { //if there is a char after cmd
+            if (input_array[key.length()]!=' ') return "";  //non-space follows
+        }
+        std::string cmd_str = input_array.substr(adr,cmd_sz); //cut cmd out
+        //input_array=""; //erase buffer
+        return cmd_str;
+    } else return "";
+}
+
+std::vector<std::string> Interface::tokenize(std::string istr) { //tokenize input
+	std::vector<std::string> sv; //string vector
+	std::string tmp="";
+	for (uint8_t i=0; i<istr.length(); i++) {
+		char ch=istr.at(i);
+		if (ch==' '||ch=='\r'||ch=='\n'||ch==';') { //on delimiters
+			if (tmp.length()>0) sv.push_back(tmp); //push non empty token
+			tmp=""; //reset temp
+		} else {
+			tmp+=std::string(1,ch); //transfer char from input to temp
+		}
+	}
+	if (tmp.length()>0) sv.push_back(tmp); //push last token
+	return sv;
+}
+
+bool Interface::process_tokens(std::vector<std::string> sv) {
+	if (sv.size()==0) return 0;
+	input_params.clear();
+	for (uint8_t i=1; i<sv.size(); i++) { //first token already matched cmd
+		//todo add check if parameter is numeric, else clear params and return 0;
+		input_params.push_back( std::atof(sv.at(i).c_str()) ); //convert to float
+	}
+	return 1;
+}
+
+void Interface::process_message() {
+	//print("processing\n\r");
+	const std::vector<std::string> keywords = {
+		"shutdown",			// 1
+		"disp",				// 2
+		"force_balance",	// 3
+		"fb_stop",			// 4
+		"forbid_bal",		// 5
+		"unforbid_bal",		// 6
+		"monitor",			// 7
+		"stop_monitor",		// 8
+		"dump_log",			// 9			// to print out the battery charging/discharging log stored in flash memory [CKL worklog 23-W16-01]
+		// [FF 2023.09.28] adding msg that will be sent from charger
+		"cha"				// 10
+		// [FF End]
+	};
+	for (uint8_t cmd_num=0; cmd_num<keywords.size(); cmd_num++) { //go through keywords
+		std::string msg=match(keywords[cmd_num]); //match keyword
+		if (msg.length()>0) { //if matched
+			//print("matched\n\r");
+			// [FF 2023.09.28] specific decode charger msg
+			if( cmd_num != CHARGER ){
+				bool ok=process_tokens(tokenize(msg)); //tokenize and extract data
+				if (ok) resolve_cmd(cmd_num); //do what is necessary
+			}
+			else if( cmd_num == CHARGER ){
+				if( msg.length() == 22 && eval_charger_msg( msg.substr(4, msg.length()-4) ) == true ){
+					int a = std::stoi(msg.substr(4, 2));
+					int b = std::stoi(msg.substr(11, 2));
+					int chksum = std::stoi(msg.substr(20, 2));
+					if( chksum == ( a + b ) % 100 ){
+						charger_info = " " + msg.substr(4, 13);
+						int stat = std::stoi(msg.substr(18, 1));
+						if( stat == 0 ){
+							charger_info = " Charging:" + charger_info;
+							bm->charge_stat_fr_charger = true;
+							bm->charge_stat_connect = true;
+							bm->is_charger_existed = true;
+						}
+						else{
+							charger_info = " Non-charging:" + charger_info;
+							bm->charge_stat_fr_charger = false;
+							bm->charge_stat_connect = true;
+						}
+					}
+					else{
+						charger_info = " Charger invalid chksum";
+						bm->charge_stat_fr_charger = false;
+						bm->charge_stat_connect = true;
+					}
+				}
+				else{
+					charger_info = " Charger invalid data";
+					bm->charge_stat_fr_charger = false;
+					bm->charge_stat_connect = true;
+				}
+
+//				charger_info = " " + msg.substr(4, msg.length()-4);
+			}
+			// [FF End]
+			return;
+		} //else print(std::to_string(cmd_num)+" no match\n\r");
+	}
+}
+// [FF 2023.10.03] Check every single byte from charger if they are in the right position
+bool Interface::eval_charger_msg( std::string _str ){
+	bool ret_val = true;
+    for( uint8_t i = 0; i < _str.length(); i ++ ){
+        char c = _str.at(i);
+        if( i == 5 && c == 'v' ) {}
+        else if( i == 12 && c == 'A' ) {}
+        else if( ( i == 6 || i == 13 || i == 15 ) && c == ' ' ) {}
+        else if( ( i == 2 || i ==  9 ) && c == '.' ) {}
+        else if( c >= 0x30 && c <= 0x39 ) {}
+        else ret_val = false;
+    }
+	return ret_val;
+}
+// [FF End]
+
+void Interface::resolve_cmd(uint8_t cmd_num) { //resolve command
+	//print("resolving cmd\n\r");
+	//todo push back interpretation
+
+	int psz=input_params.size();
+	uint8_t tc=bm->total_cells;
+
+	switch(cmd_num) {
+// [CKL] : removed "shutdown" command per Chris' request		
+//	case SHUTDOWN: {
+//		print("shutting down\n\r");
+//		bm->order_shutdown();
+//	} break;
+// [CKL end]	
+	case DISPLAY: {
+		print("changing display settings\n\r");
+		//input 0 means "clear whatever was before"
+		bool clr=(psz==0); //clear if no params passed
+		for (uint8_t i=0; i<psz; i++) { //search for zeroes
+			if (int(input_params.at(i))==0) clr=1; //on zero clear=1
+		}
+		if (clr) { //clear old settings
+			for (uint8_t i=0; i<disp_blocks; i++) disp[i]=0;
+		}
+		for (uint8_t i=0; i<psz; i++) { //go through params
+			uint8_t p = uint8_t(input_params.at(i));
+			if (p>0 && p<disp_blocks) disp[p]=1; //toggle bit
+		}
+	} break;
+	case FORCE_BALANCING: {
+		print("triggering force balance\n\r");
+		for (uint8_t i=0; i<std::min(psz,10); i++) { //no more than 10 cells at a time
+			uint8_t p=round(input_params.at(i)); //grab a parameter
+			if (p<tc) bm->balancing_override[p]=1; //if in range, set override
+		}
+	} break;
+	case FORCE_BALANCE_STOP: {
+		print("stopping force balance\n\r");
+		for (uint8_t i=0; i<tc; i++) bm->balancing_override[i]=0; //cancel all overrides
+	} break;
+	case FORBID_BALANCING: {
+		bm->balance_forbidden=1;
+	} break;
+	case UNFORBID_BALANCING: {
+		bm->balance_forbidden=0;
+	} break;
+	case MONITORING: {
+		print("data monitoring mode\n\r");
+		bm->setup_monitoring_timer();
+		bm->monitoring=1;
+	} break;
+	case STOP_MONITORING: {
+		print("data monitoring off\n\r");
+		bm->monitoring=0;
+	} break;
+#ifdef RECORD_CHARGING_CYCLE
+	case DUMP_LOG: {
+		print("[Batteries charging cycle log]\r\n");
+		for (uint8_t i=0; i<disp_blocks; i++) disp[i]=0;
+		disp[DUMP_BAT_LOG]=1;		
+	} break;
+#endif	
+	default:
+		print("unrecognized cmd\n\r");
+	}
+}
+
+//OUTPUT FUNCTIONS
+
+void Interface::print(char c) {
+	tx_buf[0]=c;
+	HAL_UART_Transmit(huart1,tx_buf,1,100);
+}
+
+void Interface::print(std::string s) {
+	uint8_t sz=s.length();
+	if (sz>0) {
+		if (sz>100) sz=100;
+		for (uint8_t i=0; i<sz; i++) tx_buf[i]=(uint8_t)s.at(i);
+		HAL_UART_Transmit(huart1,tx_buf,sz,100);
+	}
+}
+
+bool Interface::interface_output_timeout() { //checks for timeout and reloads timer
+	uint8_t N = interface_output_timer_nr;
+	bool to=clk->timed_out(N); //check for timeout
+	if (to) { //timed out
+		clk->clear_flag(N); //manual clear
+	}
+	return to; //return timeout flag
+}
+
+std::string Interface::charger_checksum(std::string in) {
+	uint8_t v=0;
+	for(uint8_t i=0; i<in.length(); i++) v^=in.at(i); //calculate checksum
+	char buf[3];
+	sprintf(buf,"%02X", v); //format
+	return std::string(buf); //output
+}
+
+std::string Interface::compose_charger_string() { //make charger string
+	//These flags commented below are taken from T400 BMS version
+	//some have been removed to allow the T150 to communicate with the T150 charge controller which looks for specific size data string
+	//flags in order: UV (under-voltage), OV (over-voltage), OW (open wires),
+	//OT (over temperature), TF (thermometer fault), Z (zero), CH (ok to charge),
+	//BL (ok to balance), DE (discharge enable), CE (charge enable)
+	char temp[8];
+	std::string charger_string="";
+	std::string monitor_message;
+
+// [CKL] : more debug messages ... will remove for official release
+/* // removed after debug had finished
+	char stemp[15];
+	std::string sblock;
+
+	sblock+="Time: ";
+	sprintf(stemp,"%011.2f", clk->get_time()/1000.0);
+	sblock+=stemp;
+	sblock+=" | board temp: ";
+	sprintf(stemp,"%05.1f", bm->thermometer);
+	sblock+=stemp;
+	sblock+="\r\n";	
+*/	
+// [CKL end]
+
+	if (bm->monitoring==1) monitor_message = "DATA MONITORING ";
+	else monitor_message = " ";
+
+	sprintf(temp,"%03i", device_ID); //format ID
+	charger_string=charger_string+temp; //add ID
+	sprintf(temp,"%06.3f", bm->total_voltage); //format pack voltage
+	charger_string=charger_string+","+temp; //add pack voltage
+	sprintf(temp,"%05.3f", bm->lowest_cell); //format min cell
+	charger_string=charger_string+","+temp; //add min cell
+	sprintf(temp,"%05.3f", bm->highest_cell); //format max cell
+	charger_string=charger_string+","+temp; //add max cell
+	charger_string=charger_string+","+std::to_string(bm->UV); //add UV flag
+	charger_string=charger_string+","+std::to_string(bm->OV); //add OV flag
+	charger_string=charger_string+","+std::to_string(bm->OW); //add OW flag
+	charger_string=charger_string+","+std::to_string(bm->OT); //add OT flag
+	charger_string=charger_string+",0"; //add Z flag
+// [CKL worklog 22-W11-07]	
+	if(bm->fForceChargerOff) charger_string=charger_string+",0";
+	else charger_string=charger_string+","+std::to_string(bm->ok_to_charge); //add ok to charge flag
+// [CKL end]
+	charger_string=charger_string+",T150,";
+	std::string cs=charger_checksum(charger_string); //calculate checksum
+//	return "<"+charger_string+"*"+cs+"> "+monitor_message+" v_factor: " + std::to_string(bm->v_factor) + " v_difference: " + std::to_string(bm->v_difference) + "\n\r\n";
+// [CKL] : more debug messages ... will remove for official release
+/*
+	if(bm->charge_status){
+		return "<"+charger_string+"*"+cs+"> CHARGING "+monitor_message+"\n\r";;//+sblock;
+	}else{
+		return "<"+charger_string+"*"+cs+"> NOT CHARGING "+monitor_message+"\n\r";;//+sblock;
+	}
+*/
+// [CKL end]
+
+	return "<"+charger_string+"*"+cs+"> "+monitor_message+"\n\r";
+
+//	return "<"+charger_string+"*"+cs+"> "+ monitor_message + " Charge status: " + std::to_string(bm->charge_status)+"\n\r\n";
+
+}
+
+void Interface::output() { //text output happens here
+#ifdef RECORD_CHARGING_CYCLE
+	// [FF 2023.10.09]
+	if( disp[DUMP_BAT_LOG]  || bm->press_to_dump_log ){
+		char string[80];
+		float nCycle;
+		uint16_t nRecord;
+
+		nCycle = (float)FlashRead<uint32_t>(USER_PARA_FLASH+OFFSET_ACC_CYCLE_COUNT);
+		if(nCycle == 0xFFFFFFFF) nCycle=0;
+		nCycle = nCycle / 100.0f;
+
+		nRecord = FlashRead<uint16_t>(USER_PARA_FLASH+OFFSET_TOTAL_RECORD_LOGGED);
+		
+		if(nCycle==0){
+			strcpy(string,"Total charging cycle count = 0\r\nThe battery log is empty !\r\n");
+			print(string);
+		}
+		else{
+			sprintf(string,"Total charging cycle count = %.2f\r\n",nCycle);
+			print(string);
+			for(uint16_t i=0; i<nRecord; i++){
+				if(i%BATT_RECORD_PER_SECTOR == 0){
+					FlashReadSector(BATT_LOG_FLASH + (i / BATT_RECORD_PER_SECTOR)*FLASH_SECTOR_SIZE, flash_data_buf.quadword);					
+				}
+				uint32_t record_start_offset=(i%BATT_RECORD_PER_SECTOR)*BATT_LOG_RECORD_SIZE;
+				// [FF 2023.09.26] enhanced get percentage
+				uint8_t _volt_start_dec = (((flash_data_buf.byte[record_start_offset+OFFSET_VOLT_START]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_VOLT_START]&0x0F);
+				uint8_t _volt_start_float = (((flash_data_buf.byte[record_start_offset+OFFSET_VOLT_START+1]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_VOLT_START+1]&0x0F);
+				uint8_t _volt_stop_dec = (((flash_data_buf.byte[record_start_offset+OFFSET_VOLT_END]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_VOLT_END]&0x0F);
+				uint8_t _volt_stop_float = (((flash_data_buf.byte[record_start_offset+OFFSET_VOLT_END+1]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_VOLT_END+1]&0x0F);
+				uint32_t _time_span = *((uint32_t*)&flash_data_buf.byte[record_start_offset+OFFSET_TIMESPAN]);
+				uint8_t _temp_1_dec = (((flash_data_buf.byte[record_start_offset+OFFSET_TEMP_1]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_TEMP_1]&0x0F);
+				uint8_t _temp_1_float = (((flash_data_buf.byte[record_start_offset+OFFSET_TEMP_1+1]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_TEMP_1+1]&0x0F);
+				uint8_t _temp_2_dec = (((flash_data_buf.byte[record_start_offset+OFFSET_TEMP_2]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_TEMP_2]&0x0F);
+				uint8_t _temp_2_float = (((flash_data_buf.byte[record_start_offset+OFFSET_TEMP_2+1]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_TEMP_2+1]&0x0F);
+				uint8_t _temp_3_dec = (((flash_data_buf.byte[record_start_offset+OFFSET_TEMP_3]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_TEMP_3]&0x0F);
+				uint8_t _temp_3_float = (((flash_data_buf.byte[record_start_offset+OFFSET_TEMP_3+1]&0xF0)>>4)*10) + (flash_data_buf.byte[record_start_offset+OFFSET_TEMP_3+1]&0x0F);
+
+				float _volt_start = _volt_start_dec + (float)_volt_start_float/100;
+				float _volt_stop = _volt_stop_dec + (float)_volt_stop_float/100;
+				uint8_t _percent_start = bm->get_charge_percentage(_volt_start);
+				uint8_t _percent_stop = bm->get_charge_percentage(_volt_stop);
+				float _charge_diff = (float)(_percent_stop - _percent_start)/100;
+				uint16_t _time_s = _time_span / 1000;
+				uint16_t _time_ms = _time_span % 1000;
+				uint16_t _time_m = _time_s / 60;
+				uint16_t _time_ss = _time_s % 60;
+
+				sprintf( string, "%d.%d, %d.%d (%.2f) %dm %d.%1ds, 0, %d.%d, %d.%d, %d.%d, \r\n",
+					_volt_start_dec, _volt_start_float, _volt_stop_dec, _volt_stop_float, _charge_diff,
+					_time_m, _time_ss, _time_ms, _temp_1_dec, _temp_1_float, _temp_2_dec, _temp_2_float, _temp_3_dec, _temp_3_float
+				);
+				// [FF end]
+				print( string );
+			}
+//			print("\r\n[End of the Battery Log]\r\n\n");
+		}
+	
+		disp[DUMP_BAT_LOG]=0;	
+		disp[CHARGER_BLOCK]=1;
+		bm->press_to_dump_log = false;
+	} // [FF End]
+	else
+#endif
+	if (interface_output_timeout()) {
+		if (disp[CHARGER_BLOCK]) { //print charger block (default)
+			print(compose_charger_string());
+		}
+		if (disp[CELL_SUMMARY]) {
+			char temp[20];
+			std::string summary="Total ";
+			// [FF 2023.10.03]
+			sprintf(temp,"%07.3f (%2d)", bm->total_voltage, bm->get_charge_percentage() ); //format pack voltage
+			// [FF End]
+			summary+=temp;
+			summary+=", imbal ";
+			sprintf(temp,"%05.3f", bm->highest_cell-bm->lowest_cell); //format voltage difference
+			summary+=temp;
+			summary+=", min ";
+			sprintf(temp,"%05.3f", bm->lowest_cell); //format min cell
+			summary+=temp;
+			summary+=" max "; //todo add min cell number
+			sprintf(temp,"%05.3f", bm->highest_cell); //format max cell
+			summary+=temp;
+			summary+=" \n\r"; //todo add max cell number
+			print(summary);
+//			sprintf("\rcharging status: "+ std::to_string(bm->charge_status)+ "\n\r");
+		}
+		if (disp[ALL_VOLTAGES]) {
+			char temp[8];
+			for (uint8_t i=0; i<bm->chips; i++){ //three blocks
+				std::string vblock="";
+// [CKL] : label the voltage group, "cell 00-06 : " and "cell 07-13 : "	
+				if(i==0) vblock+="cell 00-06 : ";
+				else if(i==1) vblock+="cell 07-13 : ";
+// [CKL end]			
+				uint8_t cnt=bm->cells[i];				
+				for (uint8_t j=0; j<cnt; j++) {
+// [CKL] : To make the summation of cell voltage display in console equal the total voltage displayed
+					float v;
+					v = bm->cells_array[i][j].v_corrected;
+					v = (int)(v * 1000 + 0.5);
+					v = (float)v / 1000;
+					sprintf(temp,"%05.3f", v);
+//					sprintf(temp,"%05.3f", bm->cells_array[i][j].v_corrected);
+// [CKL end]					
+					vblock+=temp;
+					vblock+=" "; // put spaces
+//					if (j%5==4 && j!=cnt-1) vblock+="|"; //put separator after 5th
+//					else vblock+=" "; //else put spaces
+				}
+				print(vblock+"\n\r");
+			}
+		}
+//		disp[TEMPERATURES] = 1;
+		if (disp[TEMPERATURES]) {
+			char temp[8];
+			std::string block="ICs temp: ";
+			for (uint8_t i=0; i<bm->chips; i++){ //LTC temperatures
+				sprintf(temp,"%05.1f", bm->temperature[i]);
+				block+=temp;
+				block+=" ";
+			}
+			block+="| board temp: ";
+			sprintf(temp,"%05.1f", bm->thermometer);
+			block+=temp; //add onboard thermometer
+			//print(block+"\n\r");
+			//block="Ext: ";
+			//sprintf(temp,"%05.1f", bm->thermometer);
+			//block+=temp;
+			block+=" ";
+			print(block+"\n\r");
+		}
+		if (disp[BALANCE_LIST]) {
+			char temp[8];
+			std::string bblock;
+			bool override=0;
+			for (uint8_t i=0; i<bm->total_cells; i++) override|=bm->balancing_override[i];
+
+			for (uint8_t i=0; i<bm->chips; i++){ //three blocks
+				bblock="";
+				uint8_t cnt=bm->cells[i];
+				for (uint8_t j=0; j<cnt; j++) {
+					uint8_t num=bm->adr(i,j); //convert j and i into adr
+					sprintf(temp,"%02u",num); //convert adr
+					bool balance_v=(override)?bm->balancing_override[num]:bm->balance_decision[num];
+					if (balance_v) bblock+=temp; else bblock+="--"; //output
+					//todo place actual balancing mark
+					bblock+=" ";
+				}
+				print(bblock+"\n\r");
+			}
+			bblock="balance state: ";
+			if (bm->startup_phase){
+				if (bm->charge_status) bblock+=" STARTUP , ";
+				else bblock+="STARTUP  , ";
+			}
+			else bblock+="OPERATING, ";
+//			bblock+=(bm->ok_to_balance)?"BAL OK":"NOT OK";
+//			bblock+=(bm->is_balancing)?" (  Balancing  )":" (Not balancing)";
+			bblock+=(override)?"OVERRIDE":"AUTO";
+			bblock+=(bm->balance_forbidden)?", FORBIDDEN":", ALLOWED";
+			if(!bm->balance_forbidden){		// [CKL worklog 22-W19-01] : if in forbidden mode, i.e. no discharging, no related discharging message should be displayed.
+#ifdef FORCE_CONT_DISCHARGE
+				if(bm->is_balancing || override){	// [CKL worklog 22-W19-01] : if override, i.e. force discharging
+// [CKL worklog 22-W21-07] : force_balance discharging experiment
+					if(override){
+						bblock+=", DISCHARGING";
+					}
+// [CKL worklog 22-W21-07 end] 					
+					else{
+						if(bm->cell_switch_phase){
+							bblock+=(bm->cooldown_phase)?", COOLDOWN      ":", DISCHARGE ODD ";
+						}
+						else{
+							bblock+=(bm->cooldown_phase)?", COOLDOWN      ":", DISCHARGE EVEN";
+						}	
+					}			
+				}
+				else{
+					bblock+=(bm->ok_to_balance && !bm->startup_phase)?", BALANCED      ":"                ";
+				}
+#else
+				if(bm->is_balancing){
+					if(bm->cell_switch_phase){
+						bblock+=(bm->cooldown_phase)?", COOLDOWN      ":", DISCHARGE ODD ";
+					}
+					else{
+						bblock+=(bm->cooldown_phase)?", COOLDOWN      ":", DISCHARGE EVEN";
+					}				
+				}
+				else{
+					bblock+=(bm->ok_to_balance && !bm->startup_phase)?", BALANCED      ":"                ";
+				}			
+#endif							
+			}
+			// [FF 2023.09.27] Printing Charging status to observe
+			if( bm->is_charger_existed == true ){
+				if( bm->charge_stat_connect == true ){
+					bblock += ", " + charger_info;
+					bm->charge_stat_connect = false;
+					bm->charge_stat_fr_charger = false;
+				}
+				else bblock += ", No Charger";
+			}
+			// [FF End]
+//			bblock+=(bm->cooldown_phase)?", COOLDOWN":", DISCHARGE";
+//			bblock+=(bm->cell_switch_phase)?", ODD":", EVEN";
+			print(bblock+"\n\r");
+		}
+
+		if (disp[TIME_N_STATE]) {
+			char temp[12];
+			std::string sblock;
+			sblock+="Time: ";
+// [CKL] : No decimal place is needed for the time shown in the console debug output			
+//			sprintf(temp,"%011.2f", clk->get_time()/1000.0);
+			sprintf(temp,"%06.0f", clk->get_time()/1000.0);
+// [CKL end]						
+			sblock+=temp;
+			sblock+="s, Error: ";
+			sprintf(temp,"%03i", bm->error_code);
+			sblock+=temp;
+			sblock+=", Firmware: ";
+			sblock+=firmware_version;
+			sblock+=", Hardware: ";
+			sblock+=hardware_version;
+#ifdef RECORD_CHARGING_CYCLE			
+			sblock+=", charge_cycles: ";
+			sprintf(temp,"%06.2f", bm->total_cycles);
+			sblock+=temp;
+#endif
+			print(sblock+"\n\r\n");
+
+		}
+	}
+}

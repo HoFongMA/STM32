@@ -1,0 +1,362 @@
+/*
+ * display.cpp
+ *
+ *  Created on: 6 Dec 2021
+ *      Author: Elliot Page
+ */
+
+#include "Display.h"
+#include "Debug.h"
+
+#ifdef RECORD_CHARGING_CYCLE
+#include <math.h>
+#endif
+
+// [CKL] : Added "Eru" and "Ero" in display to show under-voltage and open-wire error respectively.
+#include "Balance_Master.h"
+extern Balance_Master BM; //balance master class instance
+// [CKL End]
+
+void Display::init(Clock *c, I2C_HandleTypeDef *h) {
+	hi2c1 = h;
+	error_state = NO_ERROR;
+	battery_charge = 0;
+	code = 0;
+	clk = c;
+	Startup_display_timeout_nr = clk->DISPLAY_STARTUP;
+	Charge_display_timeout_nr = clk->CHARGE_OUTPUT;
+	clk->setup_timer(Startup_display_timeout_nr, Startup_display_interval);
+	turn_off = false;
+}
+
+void Display::work() {
+
+	set_display(select_mode());
+	// [FF 2023.10.05]
+	if ( state == 1 || state == 3 || charging ) { //if button short pressed or charging detected, turn on display
+	// [FF End]
+		//if short press is detected the display is turned back on for another 10 seconds
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
+		clk->setup_timer(Charge_display_timeout_nr, Charge_display_interval);
+//		debug_print("CKL: " + std::to_string(Charge_display_timeout_nr) + " " + std::to_string(Charge_display_interval) + " " + std::to_string(charging) + "\n\r");		
+	}
+}
+
+uint8_t Display::select_mode() {
+	//selects the display mode depending on the errors or timeout
+	//startup mode forced for first 3 seconds to allow median filter to populate with voltages
+	uint8_t display_mode;
+	// [FF 2023.10.05]
+	if (!Startup_display_timeout() && !turn_off) {
+		display_mode = STARTUP;
+		clk->setup_timer(Charge_display_timeout_nr, Charge_display_interval);
+	}
+	else if ( state == 3 ){
+		display_mode = DISP_DISCHARGE;		// note: never timeout to log out by LV shutdown
+	}
+	else if (charging) {
+		display_mode = CHARGE_DISPLAY; //CHARGING;
+		clk->setup_timer(Charge_display_timeout_nr, Charge_display_interval);
+	}
+	else if (!Startup_display_timeout() && turn_off)
+		display_mode = SHUTDOWN;
+	else if (error_state && !Charge_display_timeout())
+		display_mode = ERROR_DISPLAY; //show error message
+	else if (!error_state && !Charge_display_timeout()){
+		display_mode = CHARGE_DISPLAY; //show current battery charge percentage
+	}
+	else if (Charge_display_timeout())
+		display_mode = DISPLAY_OFF; //turn off display
+	// [FF End]
+
+	return display_mode;
+}
+
+void Display::set_display(uint8_t mode) {
+	uint8_t data[2] = { 0x44, 0 }; //0x44 instructs the display driver to immediately output to the 7 segment display
+	//data[1] contains the byte that designates which of the segments to light up
+
+	//mode = DISPLAY_OFF; //TEST//
+	//battery_charge = 70; //TEST//
+
+	switch (mode) {
+	case CHARGE_DISPLAY: {
+		//convert percentage to string to isolate each digit and convert into 3 digit percentage
+		std::string s;
+		if (battery_charge < 10)
+			s = "00";
+		else if (battery_charge < 100 && battery_charge >= 10)
+			s = "0";
+		s += std::to_string(battery_charge);
+
+		//this removes any zeroes before the value i.e. 050 becomes 50
+		if (s[0] == '0' && s[1] == '0') {
+			s[0] = 'X';
+			s[1] = 'X';
+		} else if (s[0] == '0')
+			s[0] = 'X';
+
+		for (int i = 0; i < 3; i++) {
+			switch (s[i]) {
+			case '0':
+				data[1] = 0b00111111;
+				break;
+			case '1':
+				data[1] = 0b00000110;
+				break;
+			case '2':
+				data[1] = 0b01011011;
+				break;
+			case '3':
+				data[1] = 0b01001111;
+				break;
+			case '4':
+				data[1] = 0b01100110;
+				break;
+			case '5':
+				data[1] = 0b01101101;
+				break;
+			case '6':
+				data[1] = 0b01111101;
+				break;
+			case '7':
+				data[1] = 0b00000111;
+				break;
+			case '8':
+				data[1] = 0b01111111;
+				break;
+			case '9':
+				data[1] = 0b01100111;
+				break;
+			case 'X':
+				data[1] = 0b00000000;
+				break; //this indicates a blank display output
+			}
+			HAL_I2C_Master_Transmit(hi2c1, addresses[i] << 1, data, 2, 5);
+		}
+		break;
+	}
+	case ERROR_DISPLAY: {
+		//display error message
+		data[1] = 0b01111001; //E
+		HAL_I2C_Master_Transmit(hi2c1, addresses[0] << 1, data, 2, 5);
+		data[1] = 0b01010000; //r
+		HAL_I2C_Master_Transmit(hi2c1, addresses[1] << 1, data, 2, 5);
+
+//		//ordered in the order of severity of the error:
+//		//		if OW or <2v5 detected, we can't do anything
+//		//		if temp too high then need to wait till it cools down
+//		//		if cell voltage < 2v7, can't charge the battery but can balance it
+//		//		if imbalance > 40mV, can't charge the battery but can balance it
+//		if (fault_error) {
+//			data[1] = 0b01110001; //OW or cell<2V5 error
+//			break;
+//		}
+//		if (temp_error) {
+//			data[1] = 0b01111000; //overtemp error
+//			HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+//			break;
+//		}
+//		if (lv_error) {
+//			data[1] = 0b00111000; //LV error
+//			HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+//			break;
+//		}
+//		if (imbal_error) {
+//			data[1] = 0b01111100; //imbalance error
+//			HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+//			break;
+//		}
+
+//		switch (code) {
+//			case 0:
+//				data[1] = 0b00111111;
+//				break;
+//			case 1:
+//				data[1] = 0b00000110;
+//				break;
+//			case 2:
+//				data[1] = 0b01011011;
+//				break;
+//			case 3:
+//				data[1] = 0b01001111;
+//				break;
+//		}
+//		HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+
+// [CKL] : OW shows Ero, while UV shows Eru
+//		data[1] = 0b01010000; //r
+		if(BM.OW) data[1] = 0b01011100; //o
+		else if(BM.UV) data[1] = 0b00011100; //u
+		else data[1] = 0b01010000; //r
+// [CKL end]		
+		HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+		break;
+	}
+	case DISPLAY_OFF: {
+		//turn off the diplay by setting G hat high
+		data[1] = 0b00000000;
+		HAL_I2C_Master_Transmit(hi2c1, addresses[0] << 1, data, 2, 5);
+		HAL_I2C_Master_Transmit(hi2c1, addresses[1] << 1, data, 2, 5);
+		HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);
+		break;
+	}
+	case STARTUP: {
+		#ifdef SURVICE_VERSION
+			data[1] = 0b01011011; //'2'
+			HAL_I2C_Master_Transmit(hi2c1, addresses[0] << 1, data, 2, 5);
+			data[1] = 0b00111111; //'0'
+			HAL_I2C_Master_Transmit(hi2c1, addresses[1] << 1, data, 2, 5);
+			data[1] = 0b00000110; //'0'
+			//data[1] = 0b00000110; //'1'
+			HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);		
+		#else
+			#ifdef RECORD_CHARGING_CYCLE
+				//convert percentage to string to isolate each digit and convert into 3 digit percentage
+				std::string s;
+				uint32_t total_charged_cycle = round(BM.total_cycles /100.0f);
+
+				if (total_charged_cycle < 10)
+					s = "00";
+				else if (total_charged_cycle < 100 && total_charged_cycle >= 10)
+					s = "0";
+				s += std::to_string(total_charged_cycle);
+
+				#if 0
+				//this removes any zeroes before the value i.e. 050 becomes 50
+				if (s[0] == '0' && s[1] == '0') {
+					s[0] = 'X';
+					s[1] = 'X';
+				} else if (s[0] == '0')
+					s[0] = 'X';
+				#endif
+
+				for (int i = 0; i < 3; i++) {
+					switch (s[i]) {
+					case '0':
+						data[1] = 0b00111111;
+						break;
+					case '1':
+						data[1] = 0b00000110;
+						break;
+					case '2':
+						data[1] = 0b01011011;
+						break;
+					case '3':
+						data[1] = 0b01001111;
+						break;
+					case '4':
+						data[1] = 0b01100110;
+						break;
+					case '5':
+						data[1] = 0b01101101;
+						break;
+					case '6':
+						data[1] = 0b01111101;
+						break;
+					case '7':
+						data[1] = 0b00000111;
+						break;
+					case '8':
+						data[1] = 0b01111111;
+						break;
+					case '9':
+						data[1] = 0b01100111;
+						break;
+					case 'X':
+						data[1] = 0b00000000;
+						break; //this indicates a blank display output
+					}
+					HAL_I2C_Master_Transmit(hi2c1, addresses[i] << 1, data, 2, 5);
+				}			
+			#else
+				//display 'On' message for 3 seconds
+				//allows voltage median filter to populate and show accurate percentage value
+				data[1] = 0b00111111; //O
+				HAL_I2C_Master_Transmit(hi2c1, addresses[0] << 1, data, 2, 5);
+				data[1] = 0b01010100; //n
+				HAL_I2C_Master_Transmit(hi2c1, addresses[1] << 1, data, 2, 5);
+				data[1] = 0b00000000; //X
+				HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+			#endif
+		#endif
+		break;
+	}
+	case SHUTDOWN: {
+		//display 'OFF' message for 3 seconds
+		data[1] = 0b00111111; //O
+		HAL_I2C_Master_Transmit(hi2c1, addresses[0] << 1, data, 2, 5);
+		data[1] = 0b01110001; //F
+		HAL_I2C_Master_Transmit(hi2c1, addresses[1] << 1, data, 2, 5);
+		data[1] = 0b01110001; //F
+		HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
+		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
+		break;
+	}
+	case CHARGING: {
+		data[1] = 0b00111001; //C
+		HAL_I2C_Master_Transmit(hi2c1, addresses[0] << 1, data, 2, 5);
+		data[1] = 0b01110110; //H
+		//data[1] = 0b01110100; //h
+		HAL_I2C_Master_Transmit(hi2c1, addresses[1] << 1, data, 2, 5);
+		data[1] = 0b01110111; //A
+		//data[1] = 0b01101111; //g
+		HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+		break;
+	}
+	case DISP_DISCHARGE:{
+		data[1] = 0b01011100; // o
+		HAL_I2C_Master_Transmit(hi2c1, addresses[0] << 1, data, 2, 5);
+		data[1] = 0b01011100; // o
+		HAL_I2C_Master_Transmit(hi2c1, addresses[1] << 1, data, 2, 5);
+		data[1] = 0b01011100; // o
+		HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+		break;
+	}
+	case DISP_STDBY:{
+		data[1] = 0b01101101; // S
+		HAL_I2C_Master_Transmit(hi2c1, addresses[0] << 1, data, 2, 5);
+		data[1] = 0b01111000; // d
+		HAL_I2C_Master_Transmit(hi2c1, addresses[1] << 1, data, 2, 5);
+		data[1] = 0b01101110; // y
+		HAL_I2C_Master_Transmit(hi2c1, addresses[2] << 1, data, 2, 5);
+		break;
+	}
+	}
+}
+
+bool Display::Startup_display_timeout() {
+	uint8_t N = Startup_display_timeout_nr;
+	bool to = clk->timed_out(N);
+	return to;
+}
+
+bool Display::Charge_display_timeout() {
+	uint8_t N = Charge_display_timeout_nr;
+	bool to = clk->timed_out(N);
+
+	return to;
+}
+
+void Display::push_state(uint8_t error_code, uint8_t charge_percentage,
+		uint8_t button_s, bool charge_status) {
+	charging = charge_status;
+	state = button_s;
+	old_battery_charge = battery_charge;	
+	battery_charge = charge_percentage;
+
+	if (error_code != 0) {
+		error_state = ERROR;
+		code = error_code;
+	} else {
+		error_state = NO_ERROR;
+		code = 0;
+	}
+}
